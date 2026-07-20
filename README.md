@@ -1,7 +1,5 @@
 # Magus OpenSecMCP
 
-# Magus OpenSecMCP
-
 ![CI Status](https://github.com/vahive-tobias/magus-opensecmcp/actions/workflows/ci.yml/badge.svg)
 
 A deterministic execution firewall for MCP agents. Local-first, open source, no
@@ -46,6 +44,7 @@ You can install the gateway globally without needing to handle Apple developer s
 ```bash
 brew tap vahive-tobias/tap
 brew install magus-opensecmcp
+```
 
 Requires Rust and Node (the demo downstream server is `npx`-launched).
 
@@ -53,7 +52,6 @@ Requires Rust and Node (the demo downstream server is `npx`-launched).
 git clone [https://github.com/vahive-tobias/magus-opensecmcp.git](https://github.com/vahive-tobias/magus-opensecmcp.git)
 cd magus-opensecmcp
 cargo build --release
-# ... rest of your existing quickstart instructions ...
 mkdir -p /tmp/magus-demo
 echo "hello" > /tmp/magus-demo/notes.txt
 ./target/release/magus-gateway config.yaml
