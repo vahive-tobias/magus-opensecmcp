@@ -1,10 +1,5 @@
 // src/downstream.rs
 //
-// The piece that was missing from the original draft: an actual MCP client
-// half, connected to the real downstream server. Without this, "evaluate then
-// approve" approves nothing real — there was nothing on the other side of the
-// membrane to forward to. This module IS the other side.
-//
 // Transport: stdio, newline-delimited JSON-RPC, matching the framing already
 // used on the agent-facing side of the gateway. One persistent child process
 // per configured downstream server, spawned once at startup and kept alive
