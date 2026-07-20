@@ -1,0 +1,104 @@
+# config.yaml
+#
+# Point your MCP client (Claude Desktop, Claude Code, Cursor, etc.) at
+# `magus-gateway` instead of the real server directly. The gateway spawns
+# the real server itself (below) and only forwards what it approves.
+#
+# This tool list and every hash below came from a real run against the real
+# package (`npx -y @modelcontextprotocol/server-filesystem`), captured by the
+# gateway's own startup log, not typed from memory. move_file's pin below is
+# deliberately wrong by one character, on purpose, left in so that on your
+# first run you SEE the mismatch warning fire for real instead of taking the
+# hash-pinning feature on faith. Fix it once you've watched it catch it.
+
+downstream_servers:
+  - server_id: "local-filesystem"
+    transport: "stdio"
+    command: "npx"
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp/magus-demo"]
+    source_grade: "Known"
+
+tools:
+  - mcp_server_id: "local-filesystem"
+    tool_name: "read_file"
+    risk_class: "Low"
+    authority_source: "User"
+    pinned_definition_hash_hex: "bdc561725bb43b07798d52081b4b0be84ecfc6fa1240145a0d7e8ec6a8570df6"
+
+  - mcp_server_id: "local-filesystem"
+    tool_name: "read_text_file"
+    risk_class: "Low"
+    authority_source: "User"
+    pinned_definition_hash_hex: "8593d41e4610e4258bd6a669f1bdf6dfa5068c4d1e2716f13d346f0905a770da"
+
+  - mcp_server_id: "local-filesystem"
+    tool_name: "read_media_file"
+    risk_class: "Low"
+    authority_source: "User"
+    pinned_definition_hash_hex: "d3c0c556f2a84c0cc22956e19569f469c28d8021bb63658525c570eebdffa7eb"
+
+  - mcp_server_id: "local-filesystem"
+    tool_name: "read_multiple_files"
+    risk_class: "Low"
+    authority_source: "User"
+    pinned_definition_hash_hex: "d48d61df894383b27589f050936a6e9bf4f3896516d8e8e82236fe148a7fda91"
+
+  - mcp_server_id: "local-filesystem"
+    tool_name: "list_directory"
+    risk_class: "Low"
+    authority_source: "User"
+    pinned_definition_hash_hex: "a96528e7c6db1f7613718ed6aa974d769b7dbc61c40e9e55d61793c62b9f6a76"
+
+  - mcp_server_id: "local-filesystem"
+    tool_name: "list_directory_with_sizes"
+    risk_class: "Low"
+    authority_source: "User"
+    pinned_definition_hash_hex: "8a736d4e3014a62e40223b193d24f8672287a3c4f5f1f44ed86f988e70e64e47"
+
+  - mcp_server_id: "local-filesystem"
+    tool_name: "directory_tree"
+    risk_class: "Low"
+    authority_source: "User"
+    pinned_definition_hash_hex: "69ea944eadd537f5551734888562c7b6495e3844f1df4482d82f23450d900593"
+
+  - mcp_server_id: "local-filesystem"
+    tool_name: "search_files"
+    risk_class: "Low"
+    authority_source: "User"
+    pinned_definition_hash_hex: "1628823f518c92ff5e89fa62567b171d8a5561c7f7aaf3404836dea79a7624e5"
+
+  - mcp_server_id: "local-filesystem"
+    tool_name: "get_file_info"
+    risk_class: "Low"
+    authority_source: "User"
+    pinned_definition_hash_hex: "390d57199dda71a93dd4d706aa0d5a5f47646f53eaee870addc5df2113387880"
+
+  - mcp_server_id: "local-filesystem"
+    tool_name: "list_allowed_directories"
+    risk_class: "Low"
+    authority_source: "User"
+    pinned_definition_hash_hex: "6a0bda4c70013fd6d2b1f7c95598dc9e585454b72a5834f361bacd2549a8b4f7"
+
+  - mcp_server_id: "local-filesystem"
+    tool_name: "create_directory"
+    risk_class: "Medium"
+    authority_source: "User"
+    pinned_definition_hash_hex: "774a60a313bb9defb5cd75fb58b52c1e175af20b997d286d51bf8150166d8a9c"
+
+  - mcp_server_id: "local-filesystem"
+    tool_name: "write_file"
+    risk_class: "High"
+    authority_source: "User"
+    pinned_definition_hash_hex: "294c74bcd5771127e62e74e83c9b1b4218ff5cf669f7d73373921857085e97c9"
+
+  - mcp_server_id: "local-filesystem"
+    tool_name: "edit_file"
+    risk_class: "High"
+    authority_source: "User"
+    pinned_definition_hash_hex: "85279d68f5f8332813ab6950a77c9a3873e67187457ffb26dfdfbf26c4bcb708"
+
+  - mcp_server_id: "local-filesystem"
+    tool_name: "move_file"
+    risk_class: "High"
+    authority_source: "User"
+    pinned_definition_hash_hex: "02eef4d10497ea0a8258a6b4aad5b87dc492f93b86d388baa63d39b230622a5d"
