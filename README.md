@@ -6,9 +6,9 @@ leaving your machine.
 
 It sits between your MCP client (Claude Desktop, Claude Code, Cursor, etc.)
 and your real MCP servers. It approves or blocks each tool call using explicit
-rules — a per-tool risk registry, cryptographic hash-pinning of tool
+rules, a per-tool risk registry, cryptographic hash-pinning of tool
 definitions, and a structural taint-tracking state machine over tool
-*responses* — never a model call. If it blocks something, nothing downstream
+*responses* never a model call. If it blocks something, nothing downstream
 of it ever runs.
 
 ## Status
@@ -25,8 +25,8 @@ package, not simulated:
   deliberately off by one character so your first run shows you the mismatch
   warning firing for real, not just described in a comment.
 - The taint-tracking demo works end to end: reading a file with an injection
-  attempt in it gets approved (reading is low-risk), but the *next* call —
-  even an identical, previously-successful read — gets blocked, because the
+  attempt in it gets approved (reading is low-risk), but the *next* call
+  even an identical, previously-successful read gets blocked, because the
   connection is now flagged. The blocked write genuinely does not happen; the
   file on disk is untouched.
 
@@ -62,11 +62,11 @@ printf '%s\n' \
 ## About the pinned dependency versions in Cargo.toml
 
 `blake3`, `getrandom`, `uuid`, and `indexmap` are pinned to specific older
-versions. That's not a requirement of this code — it's because this was
+versions. That's not a requirement of this code it's because this was
 verified in a sandbox stuck on an 18-month-old `rustc` (1.75) that can't parse
 manifests requiring `edition2024`, which recent releases of those crates need.
 If you're on a current toolchain (almost certainly true), delete those pin
-lines and run `cargo update`, or just leave them — either works. `Cargo.lock`
+lines and run `cargo update`, or just leave them either works. `Cargo.lock`
 is committed on purpose, since this is a binary, and it's the exact lockfile
 this was verified against.
 
@@ -114,7 +114,7 @@ tools:
 ```
 
 Any tool the downstream server advertises that *isn't* in `tools:` still
-works — it's auto-registered at a `Medium` ceiling (`bootstrap: true` in the
+works it's auto-registered at a `Medium` ceiling (`bootstrap: true` in the
 audit log), never silently trusted at `Low` and never silently blocked
 outright, so an unclassified tool doesn't break your agent on day one, but is
 visibly flagged for you to go classify properly.
@@ -124,7 +124,7 @@ visibly flagged for you to go classify properly.
 A pack is a pre-reviewed risk classification for a well-known server, meant
 to be copied into your own `config.yaml`. `filesystem.yaml` is the one pack
 in the repo that's been verified end-to-end against the real published
-package as of this commit — every hash in it is real. Treat any pack added
+package as of this commit every hash in it is real. Treat any pack added
 later as community-contributed until its own header says otherwise; a wrong
 classification shipped under a "curated" banner is worse than guessing on
 your own, so packs get reviewed like the security-relevant claims they are,
@@ -133,7 +133,7 @@ not merged like documentation. Contributions welcome — see below.
 ## Contributing a registry pack
 
 1. Point `magus-gateway` at the real server with an empty `tools:` list and
-   read the startup log — it prints every real tool name and its real hash.
+   read the startup log, it prints every real tool name and its real hash.
 2. Classify each tool's `risk_class` / `authority_source` honestly. When in
    doubt, classify one tier higher, not lower.
 3. Submit the pack with the server's real package/repo link and the date you
@@ -142,11 +142,11 @@ not merged like documentation. Contributions welcome — see below.
 
 ## Roadmap
 
-- [ ] `SourceRegistry`-style dynamic grading (promotion/demotion over time) —
+- [ ] `SourceRegistry`-style dynamic grading (promotion/demotion over time)
       v1 intentionally ships static, config-set grades only.
 - [ ] More than one downstream server exercised in the shipped demo config.
 - [ ] Packaged release binaries / Homebrew tap.
-- [ ] More registry packs (GitHub, Postgres, Slack) — verified against the
+- [ ] More registry packs (GitHub, Postgres, Slack) verified against the
       real server before merge, per the contribution rule above.
 
 ## License
