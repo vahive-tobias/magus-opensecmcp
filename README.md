@@ -50,9 +50,10 @@ brew install magus-opensecmcp
 Requires Rust and Node (the demo downstream server is `npx`-launched).
 
 ```bash
-git clone <this-repo>
+git clone [https://github.com/vahive-tobias/magus-opensecmcp.git](https://github.com/vahive-tobias/magus-opensecmcp.git)
 cd magus-opensecmcp
 cargo build --release
+# ... rest of your existing quickstart instructions ...
 mkdir -p /tmp/magus-demo
 echo "hello" > /tmp/magus-demo/notes.txt
 ./target/release/magus-gateway config.yaml
