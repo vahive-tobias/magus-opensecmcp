@@ -1,5 +1,9 @@
 # Magus OpenSecMCP
 
+# Magus OpenSecMCP
+
+![CI Status](https://github.com/vahive-tobias/magus-opensecmcp/actions/workflows/ci.yml/badge.svg)
+
 A deterministic execution firewall for MCP agents. Local-first, open source, no
 LLM judging the thing it's meant to secure, no cloud dependency, no telemetry
 leaving your machine.
@@ -34,7 +38,14 @@ What isn't done yet: dynamic (learned) server trust grading, more than one
 downstream server at a time in the demo config, and a packaged binary release
 — see [Roadmap](#roadmap).
 
-## Quickstart
+## Installation & Quickstart
+
+### macOS (via Homebrew)
+You can install the gateway globally without needing to handle Apple developer signing certificates:
+
+```bash
+brew tap vahive-tobias/tap
+brew install magus-opensecmcp
 
 Requires Rust and Node (the demo downstream server is `npx`-launched).
 
