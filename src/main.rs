@@ -250,6 +250,7 @@ async fn handle_tools_call(
     };
 
     let entry = registry.lookup(&mcp_server_id, tool_name);
+    let egress_bytes = serde_json::to_vec(&arguments).map(|b| b.len()).unwrap_or(0);
     let proposal = Proposal {
         id: Uuid::new_v4().to_string(),
         risk_class: entry.risk_class,
@@ -258,6 +259,7 @@ async fn handle_tools_call(
         mcp_server_id: mcp_server_id.clone(),
         tool_name: tool_name.to_string(),
         bootstrap: entry.bootstrap,
+        egress_bytes,
     };
 
     let mut mem = membrane.lock().await;
