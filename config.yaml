@@ -10,6 +10,9 @@
 # deliberately wrong by one character, on purpose, left in so that on your
 # first run you SEE the mismatch warning fire for real instead of taking the
 # hash-pinning feature on faith. Fix it once you've watched it catch it.
+#
+# if you are running this through Windows and the gateway fails 
+# change -> command: "npx" to command: "npx.cmd" at line 20
 
 downstream_servers:
   - server_id: "local-filesystem"
