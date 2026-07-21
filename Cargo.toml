@@ -19,11 +19,7 @@ anyhow = "1"
 dirs = "5.0"
 chrono = "0.4"
 
-# Pinned to versions that predate the ecosystem's move to edition2024: this
-# sandbox's build toolchain (rustc 1.75, from Ubuntu's apt repo) can't parse
-# manifests that require it. Pins exist for this specific verification pass;
-# a contributor on a current (2025+) toolchain can safely loosen them.
-blake3 = "=1.5.4"
-getrandom = "=0.2.15"
-uuid = { version = "=1.10.0", features = ["v4"] }
-indexmap = "=2.2.6"
+blake3 = "1.5"
+getrandom = "0.2"
+uuid = { version = "1.10", features = ["v4"] }
+indexmap = "2.2"
