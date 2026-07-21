@@ -23,6 +23,16 @@ pub struct Proposal {
     pub tool_name: String,
     #[serde(default)]
     pub bootstrap: bool,
+    /// The real size (bytes) of this call's actual arguments - what the agent
+    /// is genuinely sending outbound this turn. Previously this was faked as
+    /// a near-constant `proposal.id.len() + 256` (~290 bytes, dominated by a
+    /// fixed-length UUID), which was almost always LARGER than the decay
+    /// threshold computed from a typical tool response - meaning any
+    /// elevation decayed back to Clean on the very next call, regardless of
+    /// what that call actually was. A real, variable measure of outbound
+    /// content is required for the decay model to mean anything at all.
+    #[serde(default)]
+    pub egress_bytes: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -149,7 +159,7 @@ impl Membrane {
         self.agent_accumulators.insert(connection_id, new_agent_bp);
         self.executed_proposals.insert(proposal.id.clone());
 
-        tracker.record_outbound_and_decay(proposal.id.len() + 256);
+        tracker.record_outbound_and_decay(proposal.egress_bytes.max(1));
 
         let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         audit.log(AuditRecord {
