@@ -215,3 +215,289 @@ impl Membrane {
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provenance::ProvenanceState;
+    use std::path::PathBuf;
+
+    fn temp_audit_path() -> PathBuf {
+        std::env::temp_dir()
+            .join(format!("magus-membrane-test-{}", Uuid::new_v4()))
+            .join("audit.jsonl")
+    }
+
+    fn make_membrane(max_agents: usize, monthly_limit: u32) -> Membrane {
+        Membrane::new("test-session".to_string(), max_agents, monthly_limit)
+    }
+
+    fn make_proposal(
+        id: &str,
+        risk_class: RiskClass,
+        authority_source: AuthoritySource,
+        external_content_influence: bool,
+    ) -> Proposal {
+        Proposal {
+            id: id.to_string(),
+            risk_class,
+            authority_source,
+            external_content_influence,
+            mcp_server_id: "server-a".to_string(),
+            tool_name: "tool-a".to_string(),
+            bootstrap: false,
+            egress_bytes: 100,
+        }
+    }
+
+    #[test]
+    fn replay_detection_second_call_with_same_id_is_rejected() {
+        let mut membrane = make_membrane(3, 5000);
+        let connection_id = Uuid::new_v4();
+        membrane.register_agent(connection_id).unwrap();
+        let mut tracker = AgentProvenanceTracker::new();
+        let audit = AuditLogger::new_with_path(temp_audit_path(), "test-session");
+        let proposal = make_proposal("prop-1", RiskClass::Low, AuthoritySource::User, false);
+
+        assert!(
+            membrane.evaluate(&proposal, connection_id, &mut tracker, &audit).is_ok(),
+            "first evaluation of a fresh id must succeed"
+        );
+        let second = membrane.evaluate(&proposal, connection_id, &mut tracker, &audit);
+        assert_eq!(second, Err(RejectionCode::ReplayDetected));
+    }
+
+    #[test]
+    fn quota_exceeded_rejects_even_an_otherwise_approvable_proposal() {
+        // monthly_eval_limit = 1: the first call consumes the quota; the
+        // second, even though otherwise fully approvable on its own merits,
+        // must be rejected purely on quota grounds.
+        let mut membrane = make_membrane(3, 1);
+        let connection_id = Uuid::new_v4();
+        membrane.register_agent(connection_id).unwrap();
+        let mut tracker = AgentProvenanceTracker::new();
+        let audit = AuditLogger::new_with_path(temp_audit_path(), "test-session");
+
+        let p1 = make_proposal("prop-1", RiskClass::Low, AuthoritySource::User, false);
+        assert!(membrane.evaluate(&p1, connection_id, &mut tracker, &audit).is_ok());
+
+        let p2 = make_proposal("prop-2", RiskClass::Low, AuthoritySource::User, false);
+        let result = membrane.evaluate(&p2, connection_id, &mut tracker, &audit);
+        assert_eq!(result, Err(RejectionCode::EvaluationLimitReached));
+    }
+
+    #[test]
+    fn authority_laundering_external_influence_plus_user_authority_is_rejected() {
+        let mut membrane = make_membrane(3, 5000);
+        let connection_id = Uuid::new_v4();
+        membrane.register_agent(connection_id).unwrap();
+        let mut tracker = AgentProvenanceTracker::new();
+        let audit = AuditLogger::new_with_path(temp_audit_path(), "test-session");
+
+        let proposal = make_proposal("prop-1", RiskClass::Low, AuthoritySource::User, true);
+        let result = membrane.evaluate(&proposal, connection_id, &mut tracker, &audit);
+        assert_eq!(result, Err(RejectionCode::AuthorityLaundering));
+    }
+
+    #[test]
+    fn external_authority_with_critical_effective_risk_is_rejected() {
+        let mut membrane = make_membrane(3, 5000);
+        let connection_id = Uuid::new_v4();
+        membrane.register_agent(connection_id).unwrap();
+        let mut tracker = AgentProvenanceTracker::new();
+        let audit = AuditLogger::new_with_path(temp_audit_path(), "test-session");
+
+        // state is Clean, so modulate_risk_class leaves Critical unchanged
+        // and doesn't itself error - effective_risk stays Critical, which
+        // is what this check needs to fire on.
+        let proposal = make_proposal("prop-1", RiskClass::Critical, AuthoritySource::External, false);
+        let result = membrane.evaluate(&proposal, connection_id, &mut tracker, &audit);
+        assert_eq!(result, Err(RejectionCode::ExternalAuthorityViolation));
+    }
+
+    #[test]
+    fn risk_floor_exceeded_rejects_only_the_crossing_proposal_not_earlier_ones() {
+        let mut membrane = make_membrane(3, 5000);
+        let connection_id = Uuid::new_v4();
+        membrane.register_agent(connection_id).unwrap();
+        let mut tracker = AgentProvenanceTracker::new();
+        let audit = AuditLogger::new_with_path(temp_audit_path(), "test-session");
+
+        // SESSION_INIT_BP = 100, High risk class costs 2000 BP each (no
+        // external influence, state stays Clean so no bump). 100 + 2000*4
+        // = 8100 (< RISK_FLOOR_BP = 9500, all four approved); the 5th call
+        // would take it to 10100 (>= 9500), which must be the one rejected.
+        for i in 0..4 {
+            let proposal = make_proposal(&format!("prop-{i}"), RiskClass::High, AuthoritySource::User, false);
+            let result = membrane.evaluate(&proposal, connection_id, &mut tracker, &audit);
+            assert!(result.is_ok(), "proposal {i} should have been approved before the floor was crossed");
+        }
+
+        let crossing = make_proposal("prop-crossing", RiskClass::High, AuthoritySource::User, false);
+        let result = membrane.evaluate(&crossing, connection_id, &mut tracker, &audit);
+        assert_eq!(result, Err(RejectionCode::RiskFloorExceeded));
+    }
+
+    #[test]
+    fn external_content_influence_costs_135_percent_of_base_bp() {
+        let mut membrane = make_membrane(3, 5000);
+        let connection_id = Uuid::new_v4();
+        membrane.register_agent(connection_id).unwrap();
+        let mut tracker = AgentProvenanceTracker::new();
+        let audit = AuditLogger::new_with_path(temp_audit_path(), "test-session");
+
+        // Medium base BP = 800; with external_content_influence, cost =
+        // (800 * 135) / 100 = 1080, not the flat 800. AuthoritySource is
+        // System, not User, specifically so this doesn't also trip the
+        // separate AuthorityLaundering check (scoped to
+        // external_content_influence && authority_source == User).
+        let proposal = make_proposal("prop-1", RiskClass::Medium, AuthoritySource::System, true);
+        let result = membrane.evaluate(&proposal, connection_id, &mut tracker, &audit);
+        assert!(result.is_ok());
+
+        let expected_bp = SESSION_INIT_BP + 1080;
+        assert_eq!(
+            *membrane.agent_accumulators.get(&connection_id).unwrap(),
+            expected_bp,
+            "external_content_influence must cost 135% of the base BP, not the flat base amount"
+        );
+    }
+
+    #[test]
+    fn successful_evaluation_records_id_updates_bp_and_actually_triggers_decay() {
+        let mut membrane = make_membrane(3, 5000);
+        let connection_id = Uuid::new_v4();
+        membrane.register_agent(connection_id).unwrap();
+        let mut tracker = AgentProvenanceTracker::new();
+        let audit = AuditLogger::new_with_path(temp_audit_path(), "test-session");
+
+        // Put the tracker into Elevated with a small decay_threshold so
+        // this call's egress_bytes is guaranteed to cross it - proving
+        // record_outbound_and_decay was actually invoked (a real tracker
+        // state change), not just that evaluate() returned Ok.
+        tracker.ingest_signature(ProvenanceState::Elevated, 1, "server-a", &[]);
+        let threshold = tracker.decay_threshold;
+        assert_eq!(tracker.current_state, ProvenanceState::Elevated);
+
+        let mut proposal = make_proposal("prop-1", RiskClass::Low, AuthoritySource::User, false);
+        proposal.egress_bytes = threshold + 100;
+
+        let result = membrane.evaluate(&proposal, connection_id, &mut tracker, &audit);
+        assert!(result.is_ok());
+        assert!(
+            membrane.executed_proposals.contains("prop-1"),
+            "the proposal id must be recorded as executed"
+        );
+        assert_eq!(
+            *membrane.agent_accumulators.get(&connection_id).unwrap(),
+            SESSION_INIT_BP + 200, // Low risk class base BP
+        );
+        assert_eq!(
+            tracker.current_state,
+            ProvenanceState::Clean,
+            "decay must actually have moved Elevated -> Clean given egress past threshold, not merely left evaluate() returning Ok"
+        );
+    }
+
+    #[test]
+    fn session_exhaustion_once_executed_proposals_reaches_max_nonce_cache() {
+        // MAX_NONCE_CACHE is 100_000. Calling evaluate() that many times to
+        // get here would mean 100_000 real file-backed audit log writes -
+        // slow, and it doesn't exercise anything evaluate() does
+        // differently at scale. This test lives in the same module as
+        // Membrane, so it can populate the private executed_proposals set
+        // directly to the real MAX_NONCE_CACHE boundary, then call
+        // evaluate() once against a fresh id - this still tests the actual
+        // real constant's boundary condition, just without the O(100_000)
+        // I/O cost of getting there through the public API.
+        let mut membrane = make_membrane(3, 1_000_000);
+        let connection_id = Uuid::new_v4();
+        membrane.register_agent(connection_id).unwrap();
+        let mut tracker = AgentProvenanceTracker::new();
+        let audit = AuditLogger::new_with_path(temp_audit_path(), "test-session");
+
+        for i in 0..MAX_NONCE_CACHE {
+            membrane.executed_proposals.insert(format!("preexisting-{i}"));
+        }
+        assert_eq!(membrane.executed_proposals.len(), MAX_NONCE_CACHE);
+
+        let proposal = make_proposal("fresh-id", RiskClass::Low, AuthoritySource::User, false);
+        let result = membrane.evaluate(&proposal, connection_id, &mut tracker, &audit);
+        assert_eq!(result, Err(RejectionCode::SessionExhausted));
+    }
+
+    #[test]
+    fn audit_record_content_matches_actual_outcome_for_rejection_and_approval() {
+        let path = temp_audit_path();
+        let mut membrane = make_membrane(3, 5000);
+        let connection_id = Uuid::new_v4();
+        membrane.register_agent(connection_id).unwrap();
+        let audit = AuditLogger::new_with_path(path.clone(), "test-session");
+
+        // Rejection case: tracker already Poisoned with a known
+        // triggering rule id - modulate_risk_class rejects immediately
+        // with InboundPoisoningDetected, and record_rejection logs
+        // tracker.last_triggering_rule_ids as-is.
+        let mut poisoned_tracker = AgentProvenanceTracker::new();
+        poisoned_tracker.ingest_signature(ProvenanceState::Poisoned, 10, "server-a", &["MCT-001".to_string()]);
+        let rejected = make_proposal("prop-rejected", RiskClass::Low, AuthoritySource::User, false);
+        assert_eq!(
+            membrane.evaluate(&rejected, connection_id, &mut poisoned_tracker, &audit),
+            Err(RejectionCode::InboundPoisoningDetected)
+        );
+
+        // Approval case: a fresh, Clean tracker so this proposal actually
+        // goes through.
+        let mut clean_tracker = AgentProvenanceTracker::new();
+        let approved = make_proposal("prop-approved", RiskClass::Low, AuthoritySource::User, false);
+        assert!(membrane.evaluate(&approved, connection_id, &mut clean_tracker, &audit).is_ok());
+
+        let contents = std::fs::read_to_string(&path).expect("audit log file must exist and be readable");
+        // First line is the session_start header written by
+        // new_with_path; real records follow.
+        let records: Vec<serde_json::Value> = contents
+            .lines()
+            .skip(1)
+            .map(|line| serde_json::from_str(line).expect("each audit line must be valid JSON"))
+            .collect();
+
+        let rejection_record = records
+            .iter()
+            .find(|r| r["proposal_id"] == "prop-rejected")
+            .expect("rejection record must be present in the audit log");
+        assert_eq!(rejection_record["rejection_code"], "InboundPoisoningDetected");
+        assert_eq!(rejection_record["provenance_state"], "Poisoned");
+        assert_eq!(rejection_record["triggered_rule_ids"], serde_json::json!(["MCT-001"]));
+
+        let approval_record = records
+            .iter()
+            .find(|r| r["proposal_id"] == "prop-approved")
+            .expect("approval record must be present in the audit log");
+        assert_eq!(approval_record["status"], "Approved");
+        assert_eq!(approval_record["rejection_code"], serde_json::Value::Null);
+        assert_eq!(approval_record["provenance_state"], "Clean");
+    }
+
+    #[test]
+    fn registering_beyond_max_agents_is_rejected() {
+        let mut membrane = make_membrane(2, 5000);
+        assert!(membrane.register_agent(Uuid::new_v4()).is_ok());
+        assert!(membrane.register_agent(Uuid::new_v4()).is_ok());
+        let result = membrane.register_agent(Uuid::new_v4());
+        assert_eq!(result, Err(RejectionCode::AgentLimitReached));
+    }
+
+    #[test]
+    fn deregistering_frees_a_slot_for_a_new_registration() {
+        let mut membrane = make_membrane(1, 5000);
+        let first = Uuid::new_v4();
+        assert!(membrane.register_agent(first).is_ok());
+        assert_eq!(membrane.register_agent(Uuid::new_v4()), Err(RejectionCode::AgentLimitReached));
+
+        membrane.deregister_agent(first);
+        assert!(
+            membrane.register_agent(Uuid::new_v4()).is_ok(),
+            "deregistering must free a slot for a new registration"
+        );
+    }
+}

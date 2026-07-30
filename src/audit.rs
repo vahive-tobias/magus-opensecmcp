@@ -72,6 +72,32 @@ impl AuditLogger {
         Self { path }
     }
 
+    /// Test-only: takes an explicit path instead of computing one via
+    /// `get_magus_home()`, so tests don't interleave writes into the real,
+    /// shared `~/.magus/audit.jsonl` on whatever machine runs them, and can
+    /// assert on audit record *content* by reading the file back. Does not
+    /// change `new`'s signature or any of its callers in main.rs.
+    #[cfg(test)]
+    pub fn new_with_path(path: PathBuf, session_id: &str) -> Self {
+        if let Some(parent) = path.parent() {
+            if let Err(e) = DirBuilder::new().recursive(true).create(parent) {
+                eprintln!("[AUDIT] WARN: Failed to create directory {:?}: {}", parent, e);
+            }
+        }
+
+        let header = serde_json::json!({
+            "event": "session_start",
+            "timestamp_unix": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+            "session_id": session_id
+        });
+
+        if let Ok(mut file) = OpenOptions::new().append(true).create(true).open(&path) {
+            let _ = writeln!(file, "{}", header);
+        }
+
+        Self { path }
+    }
+
     pub fn log(&self, record: AuditRecord) {
         let json_str = match serde_json::to_string(&record) {
             Ok(s) => s,
