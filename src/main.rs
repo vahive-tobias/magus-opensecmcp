@@ -31,7 +31,22 @@ struct DiscoveredServer {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let config_path = PathBuf::from(std::env::args().nth(1).unwrap_or_else(|| "config.yaml".to_string()));
+    let first_arg = std::env::args().nth(1);
+    match first_arg.as_deref() {
+        Some("--version") | Some("-V") => {
+            println!("magus-gateway {}", env!("CARGO_PKG_VERSION"));
+            std::process::exit(0);
+        }
+        Some("--help") | Some("-h") => {
+            println!("magus-gateway - a deterministic execution firewall for MCP agents.");
+            println!();
+            println!("Usage: magus-gateway [config.yaml]");
+            std::process::exit(0);
+        }
+        _ => {}
+    }
+
+    let config_path = PathBuf::from(first_arg.unwrap_or_else(|| "config.yaml".to_string()));
     if !config_path.exists() {
         eprintln!("[MAGUS] FATAL: config file not found at {:?}", config_path);
         eprintln!("[MAGUS] Usage: magus-gateway [path/to/config.yaml]");
