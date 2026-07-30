@@ -42,6 +42,14 @@ package, not simulated:
   tool that declares an `outputSchema` and returns a `structuredContent`
   that doesn't match it now drives the state machine to `Poisoned`, the
   same as any other signature hit — see "Output schema conformance" below.
+- False-positive claims in `locked-rules.yaml`'s rule comments are backed by
+  an actual three-tier test (`tests/false_positive_corpus.rs`), not just
+  comments: known-legitimate content (Dockerfiles, install READMEs,
+  `.env.example`, security write-ups quoting attack phrases as examples)
+  must stay silent or non-blocking; known-attack-shaped content must still
+  escalate. This test process is also what found and fixed a real gap —
+  a genuine leaked AWS key and AWS's own documented placeholder key used
+  to produce identical flag-only output; they don't anymore.
 
 What isn't done yet: dynamic (learned) server trust grading, more than one
 downstream server at a time in the demo config, a packaged binary release,
@@ -267,16 +275,19 @@ not merged like documentation. Contributions welcome — see below.
       confusables/homoglyph skeletonization, and a depth-capped
       base64/hex decode-and-rescan peel. v1 covers case-folding, whitespace
       collapse, zero-width stripping, and Unicode Tag-block decode only.
-- [ ] Entropy-based escalation for secret-shaped rules (e.g. distinguishing
-      a real AWS key from AWS's own documented `AKIAIOSFODNN7EXAMPLE`
-      placeholder) rather than today's flag-only default for that category.
-- [ ] Fetch and validate a tool's declared `outputSchema` at discovery time
-      (alongside the hash-pinning already done), so `SchemaConformance` can
-      actually reach `Violated` instead of sitting at `NotDeclared` — DONE.
-      Still open: `pattern`-keyword support (cheap, given `regex` is already
-      a dependency with size-bounded compilation this could reuse), and the
-      full JSON Schema vocabulary `schema_check.rs` deliberately doesn't
-      cover — see that file's header comment for the exact list.
+- [x] Entropy-based escalation for secret-shaped rules — DONE for
+      `SECRET-AWS-001`: a real leaked key and AWS's own documented
+      `AKIAIOSFODNN7EXAMPLE` placeholder no longer produce identical
+      flag-only outcomes. `SECRET-GH-001` has the identical gap and hasn't
+      been extended yet — no failing test has justified it, and this is
+      deliberately not done speculatively.
+- [x] Fetch and validate a tool's declared `outputSchema` at discovery time
+      so `SchemaConformance` can actually reach `Violated` instead of
+      sitting at `NotDeclared` — DONE. Still open: `pattern`-keyword
+      support (cheap, given `regex` is already a dependency with
+      size-bounded compilation this could reuse), and the full JSON Schema
+      vocabulary `schema_check.rs` deliberately doesn't cover — see that
+      file's header comment for the exact list.
 - [ ] Escalate registration-time tool-description hits (currently a
       warning only, `scope: tool_description` in rules.yaml) to actually
       withholding a tool on a high/critical match, the way an
