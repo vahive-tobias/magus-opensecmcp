@@ -50,6 +50,15 @@ package, not simulated:
   escalate. This test process is also what found and fixed a real gap —
   a genuine leaked AWS key and AWS's own documented placeholder key used
   to produce identical flag-only output; they don't anymore.
+- The provenance state machine and risk-evaluation engine (`provenance.rs`,
+  `membrane.rs`) — the oldest and most security-critical code in this
+  repo — now have direct unit test coverage (45 tests) instead of only
+  ever having been checked by hand. Covers the full source-grade/
+  response-shape classification table, the rule-hit corroboration logic
+  (a second ambiguous signal while already elevated escalates further —
+  a single one doesn't), the invariant that a `Poisoned` session never
+  auto-recovers regardless of how much subsequent activity occurs, and
+  the full replay/quota/authority/risk-budget rejection matrix.
 
 What isn't done yet: dynamic (learned) server trust grading, more than one
 downstream server at a time in the demo config, a packaged binary release,
@@ -61,17 +70,21 @@ noted as follow-up. See [Roadmap](#roadmap).
 ## Installation & Quickstart
 
 ### macOS (via Homebrew)
-You can install the gateway globally without needing to handle Apple developer signing certificates:
 
 ```bash
 brew tap vahive-tobias/tap
 brew install magus-opensecmcp
 ```
 
+Requires no local Rust toolchain — Homebrew builds it for you via the
+formula's own `rust` dependency.
+
+### Build from source
+
 Requires Rust and Node (the demo downstream server is `npx`-launched).
 
 ```bash
-git clone [https://github.com/vahive-tobias/magus-opensecmcp.git](https://github.com/vahive-tobias/magus-opensecmcp.git)
+git clone https://github.com/vahive-tobias/magus-opensecmcp.git
 cd magus-opensecmcp
 cargo build --release
 mkdir -p /tmp/magus-demo
@@ -239,8 +252,6 @@ project's actual schemas — self-contained structural descriptions, not
 multi-document schemas with external references — don't need. See that
 file's header comment for the exact list of JSON Schema keywords this does
 and doesn't understand.
-
-
 
 ## registry-packs/
 
