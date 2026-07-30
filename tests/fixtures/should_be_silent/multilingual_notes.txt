@@ -1,0 +1,24 @@
+Meeting notes — 2026-02-18 planning sync
+
+EN: We agreed to move the translation review earlier in the sprint so
+localization has more lead time before the release freeze. Action: Delphine
+to share the updated glossary by Friday.
+
+FR: Nous avons convenu de déplacer la révision des traductions plus tôt
+dans le sprint afin de laisser plus de temps à la localisation avant le gel
+de la version. Action : Delphine partagera le glossaire mis à jour vendredi.
+
+ES: Se decidió adelantar la revisión de traducciones dentro del sprint para
+darle más margen al equipo de localización antes del congelamiento de la
+versión. Acción: Delphine compartirá el glosario actualizado el viernes.
+
+DE: Wir haben vereinbart, die Überprüfung der Übersetzungen im Sprint
+vorzuziehen, damit das Lokalisierungsteam vor dem Release-Freeze mehr
+Vorlauf hat. Aufgabe: Delphine teilt das aktualisierte Glossar bis Freitag.
+
+JA: リリースフリーズ前にローカライズチームの準備期間を確保するため、
+翻訳レビューをスプリントの早い段階に移すことで合意しました。
+アクション: デルフィンが金曜日までに更新版の用語集を共有します。
+
+Follow-up: next sync is two weeks out, same time. Bring updated string
+counts per locale if you have them.

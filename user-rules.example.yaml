@@ -1,0 +1,68 @@
+# user-rules.example.yaml
+#
+# Copy this file to `user-rules.yaml` in the same directory as your
+# config.yaml to activate it. It is OPTIONAL — if it doesn't exist, the
+# gateway runs on locked-rules.yaml alone, which is a normal, fully
+# supported configuration, not a degraded one.
+#
+# If user-rules.yaml DOES exist, it must be valid: every pattern must
+# compile and every field must match the schema below. There is no
+# fallback — a broken user-rules.yaml stops the gateway from starting at
+# all, with a line-numbered error telling you what to fix. This is
+# deliberate: a gateway that silently drops your custom rules and keeps
+# running on locked defaults would leave you believing protections are
+# active that aren't, which is worse than the gateway refusing to start.
+# See README.md for the reasoning.
+#
+# The `action` field only supports flag | elevate | poison. There is no
+# "allow" or "bypass" value, on purpose — this file cannot express a rule
+# that WEAKENS what locked-rules.yaml already enforces, only rules that add
+# to it. If you need to reduce a false positive from a LOCKED rule, use
+# `suppressions:` below instead of trying to out-prioritize it; you cannot
+# suppress a critical-severity rule (the categories at that tier — raw
+# model control tokens, Unicode tag-block smuggling — have essentially no
+# legitimate false-positive rate and don't get an escape hatch).
+
+rules:
+  # Example: flag a path or naming convention specific to your own
+  # deployment that the shipped defaults have no way to know about.
+  - id: PROJECT-INTERNAL-001
+    category: project_specific
+    severity: high
+    match:
+      type: literal
+      pattern: "internal-prod-db-credentials"
+    scope: tool_output_only
+    action: elevate
+    notes: "Our internal secret-store key prefix. Locked-rules.yaml has no way to know this is sensitive for us specifically."
+
+  # Example: a regex rule. No backreferences or lookaround — Rust's `regex`
+  # crate deliberately doesn't support them, which is what guarantees
+  # linear-time matching against untrusted tool output regardless of what
+  # you write here.
+  - id: PROJECT-INTERNAL-002
+    category: project_specific
+    severity: medium
+    match:
+      type: regex
+      pattern: '\b(staging|prod)-deploy-key-[a-z0-9]{8,}\b'
+    scope: tool_output_only
+    action: flag
+    case_sensitive: false
+    notes: "Our deploy-key naming convention."
+
+suppressions:
+  # Example: SECRET-AWS-001 in locked-rules.yaml is flag-only by default
+  # specifically because AWS's own documentation uses the placeholder
+  # AKIAIOSFODNN7EXAMPLE, which matches the same shape. If your repo's
+  # test fixtures legitimately contain that placeholder often enough to be
+  # noisy, you can narrow enforcement for one specific downstream server —
+  # this does NOT delete the rule or make it silent; it only moves the
+  # action for hits from this server down to `flag`, which is already
+  # SECRET-AWS-001's default action, so in this example the suppression is
+  # a no-op shown for illustration. A suppression can only move toward
+  # `flag`, never past it, and the original severity is still recorded on
+  # the hit as `suppressed_from` in the audit log.
+  - rule_id: SECRET-AWS-001
+    server_id: local-filesystem
+    min_action_after_suppress: flag

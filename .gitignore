@@ -1,3 +1,6 @@
 /target
 *.log
 .DS_Store
+CLAUDE.md
+/docs/specs/
+user-rules.yaml

@@ -1,15 +1,9 @@
 // src/main.rs
 
-mod audit;
-mod downstream;
-mod hasher;
-mod membrane;
-mod provenance;
-mod quota;
-mod registry;
-
 use anyhow::{Context, Result};
-use registry::{SourceGrade, ToolRegistry};
+use magus_opensecmcp::registry::{SourceGrade, ToolRegistry};
+use magus_opensecmcp::rules_engine::{self, RuleEngine, Scope};
+use magus_opensecmcp::schema_check;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -17,11 +11,11 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::audit::AuditLogger;
-use crate::downstream::DownstreamConnection;
-use crate::hasher::{compute_definition_hash, hash_to_hex, McpToolDefinition};
-use crate::membrane::{Membrane, Proposal};
-use crate::provenance::{AgentProvenanceTracker, SchemaConformance};
+use magus_opensecmcp::audit::AuditLogger;
+use magus_opensecmcp::downstream::DownstreamConnection;
+use magus_opensecmcp::hasher::{compute_definition_hash, hash_to_hex, McpToolDefinition};
+use magus_opensecmcp::membrane::{Membrane, Proposal};
+use magus_opensecmcp::provenance::{self, AgentProvenanceTracker, SchemaConformance};
 
 const FREE_TIER_MAX_AGENTS: usize = 3;
 const DEFAULT_MONTHLY_EVAL_LIMIT: u32 = 5_000;
@@ -44,6 +38,60 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     }
 
+    // ---- Rule engine: loaded before anything else touches the network or
+    //      spawns a child process, so a broken rules file is caught as
+    //      early as possible, before any of that work happens.
+    //
+    //      Fail-closed by design, with no fallback path: if user-rules.yaml
+    //      exists and is broken in any way, the gateway refuses to start.
+    //      A silent downgrade to locked-only would leave an operator
+    //      believing their custom rules were active when they weren't,
+    //      which is a worse failure than not starting. A missing
+    //      user-rules.yaml, by contrast, is a completely normal
+    //      configuration and produces no error at all — see the three
+    //      distinct outcomes logged below, which mirror the
+    //      absent / present-and-matching / present-and-mismatched shape the
+    //      hash-pin check already uses for tool definitions further down.
+    let user_rules_path = config_path.parent().map(|dir| dir.join("user-rules.yaml"));
+    let rule_engine = match RuleEngine::load(user_rules_path.as_deref()) {
+        Ok(engine) => {
+            if engine.had_user_rules {
+                eprintln!(
+                    "[MAGUS] Loaded user-rules.yaml: {} user rule(s), {} suppression(s). {} rule(s) active in total.",
+                    engine.user_rule_count(),
+                    engine.suppression_count(),
+                    engine.total_rule_count()
+                );
+            } else {
+                eprintln!(
+                    "[MAGUS] No user-rules.yaml found at {} — running locked-rules.yaml only ({} rule(s)). \
+                     This is a normal configuration, not a degraded one; see user-rules.example.yaml to add your own.",
+                    user_rules_path
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "<none>".to_string()),
+                    engine.total_rule_count()
+                );
+            }
+            engine
+        }
+        Err(e) => {
+            eprintln!("[MAGUS] FATAL: rule engine failed to load — refusing to start.");
+            eprintln!("[MAGUS]   {}", e);
+            for cause in e.chain().skip(1) {
+                eprintln!("[MAGUS]     caused by: {}", cause);
+            }
+            eprintln!("[MAGUS]");
+            eprintln!("[MAGUS]   There is no fallback mode. A gateway silently running with less");
+            eprintln!("[MAGUS]   protection than configured is worse than one that won't start at all.");
+            eprintln!("[MAGUS]   Fix the error above and restart. If the problem is in");
+            eprintln!("[MAGUS]   user-rules.yaml and you want locked-rules.yaml only in the");
+            eprintln!("[MAGUS]   meantime, delete or rename user-rules.yaml — that's a supported,");
+            eprintln!("[MAGUS]   fully visible configuration, not a hidden degraded mode.");
+            std::process::exit(1);
+        }
+    };
+
     let registry = ToolRegistry::load_from_yaml(&config_path)
         .context("Failed to load tool registry")?;
     eprintln!("[MAGUS] Loaded config. Downstream servers: {}", registry.servers.len());
@@ -54,6 +102,13 @@ async fn main() -> Result<()> {
     let mut connections: HashMap<String, Arc<Mutex<DownstreamConnection>>> = HashMap::new();
     let mut discovered: Vec<DiscoveredServer> = Vec::new();
     let mut tool_owner: HashMap<String, String> = HashMap::new(); // tool_name -> server_id
+    // tool_name -> declared outputSchema, for tools that have one. Consulted
+    // in handle_tools_call to populate SchemaConformance instead of leaving
+    // it at NotDeclared forever — see schema_check.rs for what "conformance"
+    // does and doesn't mean here, and provenance.rs for how Violated feeds
+    // the state machine (it already did before this change; only the
+    // population of the value was missing).
+    let mut tool_output_schemas: HashMap<String, serde_json::Value> = HashMap::new();
 
     for server_cfg in &registry.servers {
         eprintln!("[MAGUS] Spawning downstream '{}': {} {:?}", server_cfg.server_id, server_cfg.command, server_cfg.args);
@@ -86,6 +141,51 @@ async fn main() -> Result<()> {
                     eprintln!("[MAGUS] '{}'/{}: no pin set yet. First-seen hash: {}", server_cfg.server_id, t.name, hash_hex);
                 }
             }
+
+            // Registration-time tool poisoning is a distinct threat from the
+            // response-poisoning this proxy otherwise watches for: a
+            // malicious or compromised downstream server can embed
+            // instructions in a tool's own DESCRIPTION, aimed at the agent
+            // reading tools/list, without the poisoned tool ever being
+            // invoked. Same rule engine, same rules.yaml, different scope —
+            // scan: tool_description rules only fire here. v1 only logs a
+            // warning; it does not withhold the tool or its description
+            // beyond what sanitize_description already does by source
+            // grade below. Escalating this to an actual block on a
+            // high/critical hit is a natural next step, not done yet.
+            let normalized_desc = rules_engine::normalize_for_matching(&t.description);
+            let desc_hits = rule_engine.scan(&normalized_desc, Scope::ToolDescription, &server_cfg.server_id);
+            if !desc_hits.is_empty() {
+                eprintln!(
+                    "[MAGUS] WARNING: '{}'/{} tool DESCRIPTION matched {} rule(s), highest severity {:?}: [{}]. \
+                     This is registration-time tool poisoning, not a response — the tool has not been called. \
+                     Review the description before trusting this tool.",
+                    server_cfg.server_id,
+                    t.name,
+                    desc_hits.hits.len(),
+                    desc_hits.max_severity().expect("non-empty summary has a max severity"),
+                    desc_hits.rule_ids().join(", ")
+                );
+            }
+
+            // Cache the declared outputSchema (if any) for response-time
+            // conformance checking, and flag at discovery time — not as a
+            // signature hit, just a heads-up — if the server got the one
+            // structural rule the MCP 2025-06-18 spec itself imposes wrong:
+            // outputSchema's root must be `type: "object"`. Getting this
+            // wrong is far more likely to be an unmaintained server than a
+            // malicious one, so this stays a warning, not an elevation.
+            if let Some(schema) = &t.output_schema {
+                if !schema_check::root_is_object_type(schema) {
+                    eprintln!(
+                        "[MAGUS] WARNING: '{}'/{} declares an outputSchema whose root is not type \"object\", \
+                         which the MCP spec requires. Conformance checking for this tool may not behave as expected.",
+                        server_cfg.server_id, t.name
+                    );
+                }
+                tool_output_schemas.insert(t.name.clone(), schema.clone());
+            }
+
             tool_owner.insert(t.name.clone(), server_cfg.server_id.clone());
         }
 
@@ -140,7 +240,7 @@ async fn main() -> Result<()> {
             "notifications/initialized" => None, // agent's own handshake notification; nothing to send back
             "tools/list" => Some(handle_tools_list(&id, &discovered)),
             "tools/call" => Some(handle_tools_call(
-                &id, &json_rpc, &registry, &tool_owner, &connections,
+                &id, &json_rpc, &registry, &rule_engine, &tool_owner, &tool_output_schemas, &connections,
                 &membrane, &provenance_tracker, &audit_logger, connection_id,
             ).await),
             _ if is_notification => None,
@@ -230,7 +330,9 @@ async fn handle_tools_call(
     id: &serde_json::Value,
     json_rpc: &serde_json::Value,
     registry: &ToolRegistry,
+    rule_engine: &RuleEngine,
     tool_owner: &HashMap<String, String>,
+    tool_output_schemas: &HashMap<String, serde_json::Value>,
     connections: &HashMap<String, Arc<Mutex<DownstreamConnection>>>,
     membrane: &Arc<Mutex<Membrane>>,
     provenance_tracker: &Arc<Mutex<AgentProvenanceTracker>>,
@@ -250,6 +352,7 @@ async fn handle_tools_call(
     };
 
     let entry = registry.lookup(&mcp_server_id, tool_name);
+    let egress_bytes = serde_json::to_vec(&arguments).map(|b| b.len()).unwrap_or(0);
     let proposal = Proposal {
         id: Uuid::new_v4().to_string(),
         risk_class: entry.risk_class,
@@ -258,6 +361,7 @@ async fn handle_tools_call(
         mcp_server_id: mcp_server_id.clone(),
         tool_name: tool_name.to_string(),
         bootstrap: entry.bootstrap,
+        egress_bytes,
     };
 
     let mut mem = membrane.lock().await;
@@ -279,22 +383,51 @@ async fn handle_tools_call(
             match call_result {
                 Ok((real_result, ingress_bytes)) => {
                     let raw_bytes = serde_json::to_vec(&real_result).unwrap_or_default();
-                    let (form, _sc, long_sc, total_bytes, hits) = provenance::classify_response(&raw_bytes);
-                    // No downstream-declared output schema is fetched in v1, so
-                    // conformance is NotDeclared unless the response fails to
-                    // parse at all (classify_response already returns Malformed
-                    // for that case, which the state machine treats as Poisoned
-                    // regardless of this field).
-                    let schema_conformance = SchemaConformance::NotDeclared;
+                    let (form, _sc, long_sc, total_bytes, combined_text) = provenance::classify_response(&raw_bytes);
+                    // No downstream-declared output schema means this stays
+                    // NotDeclared, same as before. When a schema IS
+                    // declared, the spec says the response must carry a
+                    // sibling `structuredContent` field validated against
+                    // it — but real-world servers are inconsistent about
+                    // actually populating that even when they declare the
+                    // schema (documented behavior, not a v1 guess). A
+                    // present structuredContent that fails to conform is a
+                    // real signal (-> Violated -> Poisoned, unchanged from
+                    // before). An ABSENT structuredContent when a schema was
+                    // declared deliberately stays NotDeclared rather than
+                    // Violated: penalizing every server that hasn't caught
+                    // up to the newer spec revision would make this feature
+                    // noisy against legitimate tools, not precise against
+                    // malicious ones.
+                    let schema_conformance = match tool_output_schemas.get(tool_name) {
+                        Some(schema) => match real_result.get("structuredContent") {
+                            Some(structured) if schema_check::conforms(schema, structured) => {
+                                SchemaConformance::Conformant
+                            }
+                            Some(_) => SchemaConformance::Violated,
+                            None => SchemaConformance::NotDeclared,
+                        },
+                        None => SchemaConformance::NotDeclared,
+                    };
 
                     let server_grade = registry.server_config(&mcp_server_id)
                         .map(|c| c.source_grade)
                         .unwrap_or_default();
 
-                    let new_state = provenance::compute_new_state(
-                        server_grade, form, hits, schema_conformance, total_bytes, long_sc,
+                    // Structural signals (source grade, response shape, size,
+                    // schema conformance) and pattern-hit signals (rules.yaml)
+                    // are computed independently and combined by taking the
+                    // max — see provenance.rs for why they're kept separate.
+                    let structural_state = provenance::compute_new_state(
+                        server_grade, form, schema_conformance, total_bytes, long_sc,
                     );
-                    tracker.ingest_signature(new_state, ingress_bytes, &mcp_server_id);
+
+                    let normalized = rules_engine::normalize_for_matching(&combined_text);
+                    let hit_summary = rule_engine.scan(&normalized, Scope::ToolOutputOnly, &mcp_server_id);
+                    let hit_state = provenance::state_from_rule_hits(&hit_summary, tracker.current_state);
+
+                    let new_state = structural_state.max(hit_state);
+                    tracker.ingest_signature(new_state, ingress_bytes, &mcp_server_id, &hit_summary.rule_ids());
 
                     serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": real_result })
                 }

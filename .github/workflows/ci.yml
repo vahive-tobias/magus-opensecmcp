@@ -17,10 +17,19 @@ jobs:
 
     steps:
       - name: Checkout source code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          # Pinned for the same reason Cargo.lock is committed and pinned:
+          # a floating `@stable` means "whatever Rust happens to be current
+          # the day CI runs," which makes a red build non-reproducible and
+          # impossible to bisect later — you can't tell "my code changed"
+          # apart from "the toolchain moved out from under me between runs."
+          # Bump this deliberately, on purpose, in its own commit, not as a
+          # side effect of the toolchain releasing something new.
+          toolchain: 1.97.1
 
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2

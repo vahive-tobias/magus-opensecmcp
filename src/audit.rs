@@ -35,6 +35,13 @@ pub struct AuditRecord {
     pub effective_risk_class: RiskClass,
     pub bp_consumed: u32,
     pub r_abs_bp_after: u32,
+    /// ids of any rules.yaml rules that fired on the tool response ingested
+    /// just before this proposal was evaluated. Empty most of the time.
+    /// Populated in main.rs from RuleHitSummary — see rules_engine.rs. This
+    /// is what makes a Poisoned/Elevated line in the audit log answer "which
+    /// rule did this" instead of just "the state changed".
+    #[serde(default)]
+    pub triggered_rule_ids: Vec<String>,
 }
 
 pub struct AuditLogger {

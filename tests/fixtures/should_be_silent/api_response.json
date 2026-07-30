@@ -1,0 +1,51 @@
+{
+  "status": "ok",
+  "request_id": "b7f2a6d0-3e41-4c9a-9f2e-6a1d5c8e2b77",
+  "generated_at": "2026-03-14T09:22:41Z",
+  "data": {
+    "orders": [
+      {
+        "id": "ord_10293",
+        "customer": "Priya Natarajan",
+        "total_cents": 4599,
+        "currency": "USD",
+        "status": "shipped",
+        "items": [
+          { "sku": "SKU-1002", "name": "Insulated water bottle", "qty": 1, "unit_price_cents": 2599 },
+          { "sku": "SKU-2044", "name": "Bottle brush", "qty": 2, "unit_price_cents": 1000 }
+        ],
+        "shipping_address": {
+          "line1": "482 Larkspur Ave",
+          "city": "Eugene",
+          "region": "OR",
+          "postal_code": "97401",
+          "country": "US"
+        }
+      },
+      {
+        "id": "ord_10294",
+        "customer": "Marcus Webb",
+        "total_cents": 12000,
+        "currency": "USD",
+        "status": "processing",
+        "items": [
+          { "sku": "SKU-3310", "name": "Desk lamp", "qty": 1, "unit_price_cents": 12000 }
+        ],
+        "shipping_address": {
+          "line1": "17 Cedarbrook Court",
+          "city": "Halifax",
+          "region": "NS",
+          "postal_code": "B3H 2Y1",
+          "country": "CA"
+        }
+      }
+    ],
+    "page": 1,
+    "page_size": 25,
+    "total_count": 2
+  },
+  "meta": {
+    "api_version": "2026-01-15",
+    "rate_limit_remaining": 987
+  }
+}

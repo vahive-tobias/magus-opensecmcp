@@ -1,0 +1,244 @@
+# locked-rules.yaml
+#
+# The maintainer-shipped default detection rules. This file is embedded into
+# the compiled binary at build time (see `include_str!` in
+# src/rules_engine.rs) — it is NOT read from disk at runtime. That is
+# deliberate: editing it requires rebuilding and redistributing the binary,
+# which is a meaningfully higher bar than local file-write access. That gap
+# is what makes it a real floor rather than just "the other config file".
+#
+# If you want to add your own rules on top of this set without forking the
+# project, copy user-rules.example.yaml to user-rules.yaml next to your
+# config.yaml and add rules there instead. Do not add rules here unless
+# they're being proposed as a change to the shipped defaults for everyone —
+# see the contribution note in README.md.
+#
+# Schema per rule:
+#   id:        unique string, referenced by suppressions and error messages
+#   category:  free-text grouping label, used for the "N hits across M
+#              categories" corroboration math in provenance::state_from_rule_hits
+#   severity:  low | medium | high | critical — corroboration/synthesis
+#              weight AND the only thing a suppression is allowed to see
+#              (critical rules can never be suppressed)
+#   match:
+#     type:    literal | regex
+#     pattern: the literal string or regex source. Literal matching is
+#              always case-insensitive (see rules_engine.rs for why mixing
+#              case-sensitivity within one shared automaton is unsafe).
+#              Regex patterns run through Rust's `regex` crate: no
+#              backreferences or lookaround are supported (this is what
+#              gives the crate its ReDoS immunity — matching untrusted
+#              haystacks is always worst-case linear time regardless of
+#              pattern shape).
+#   scope:     tool_output_only (default) | tool_description | any
+#   action:    flag | elevate | poison — the DIRECT consequence of this rule
+#              firing. There is deliberately no "allow"/"bypass" value; the
+#              grammar cannot express a rule that weakens enforcement.
+#   case_sensitive: bool, default false. Only affects `type: regex` rules.
+#   notes:     free text, documentation only, never read at runtime.
+
+rules:
+  # ── direct_system_override ────────────────────────────────────────────
+  # Attempts to make the agent treat tool OUTPUT as a fresh instruction
+  # rather than data. FP risk: security write-ups, red-team reports, and
+  # this exact conversation discuss these phrases without attempting them —
+  # scope: tool_output_only keeps this off the user's own conversation
+  # turns, which are not this proxy's concern at all.
+  - id: DSO-001
+    category: direct_system_override
+    severity: high
+    match:
+      type: regex
+      pattern: '\bignore\s+(all\s+|any\s+)?(the\s+)?(previous|prior|above)\s+(instructions?|directives?|prompts?)\b'
+    scope: tool_output_only
+    action: elevate
+    notes: "Canonical override opener."
+
+  - id: DSO-002
+    category: direct_system_override
+    severity: high
+    match:
+      type: regex
+      pattern: '\bdisregard\s+(all\s+|any\s+)?(prior|previous|earlier)\b.{0,20}(instructions?|directives?)\b'
+    scope: tool_output_only
+    action: elevate
+    notes: "Synonym family for DSO-001."
+
+  - id: DSO-003
+    category: direct_system_override
+    severity: medium
+    match:
+      type: regex
+      pattern: '\b(you are now|act as|from now on you are)\b.{0,30}\b(unrestricted|jailbroken|no rules|developer mode|admin mode)\b'
+    scope: tool_output_only
+    action: flag
+    notes: "Persona-override framing. Lower confidence alone than DSO-001/002, so flag-only unless corroborated by another category."
+
+  # ── model_control_token ───────────────────────────────────────────────
+  # Raw chat-template turn markers. Essentially zero legitimate reason to
+  # appear as literal text in filesystem/git/web-scraper tool output, so
+  # these are critical/poison with no false-positive tuning.
+  - id: MCT-001
+    category: model_control_token
+    severity: critical
+    match:
+      type: literal
+      pattern: "<|im_start|>"
+    scope: any
+    action: poison
+    notes: "ChatML role-turn open marker."
+
+  - id: MCT-002
+    category: model_control_token
+    severity: critical
+    match:
+      type: literal
+      pattern: "<|im_end|>"
+    scope: any
+    action: poison
+    notes: "ChatML role-turn close marker."
+
+  - id: MCT-003
+    category: model_control_token
+    severity: critical
+    match:
+      type: literal
+      pattern: "[INST]"
+    scope: any
+    action: poison
+    notes: "Llama-family instruction marker."
+
+  - id: MCT-004
+    category: model_control_token
+    severity: critical
+    match:
+      type: literal
+      pattern: "<<SYS>>"
+    scope: any
+    action: poison
+    notes: "Llama-family system-turn marker."
+
+  # ── secret_exfiltration ────────────────────────────────────────────────
+  - id: EXF-001
+    category: secret_exfiltration
+    severity: critical
+    match:
+      type: regex
+      pattern: '\b(send|post|curl|exfiltrate)\b.{0,40}(\.ssh|\.aws/credentials|\.env\b|id_rsa|api[_-]?key)\b.{0,40}(https?://|@[\w.\-]+)'
+    scope: tool_output_only
+    action: poison
+    notes: "Instruction to move credential-shaped content to a network destination, not just the credential shape alone."
+
+  - id: SECRET-AWS-001
+    category: secret_exfiltration
+    severity: medium
+    match:
+      type: regex
+      pattern: 'AKIA[0-9A-Z]{16}'
+    scope: tool_output_only
+    action: flag
+    case_sensitive: true
+    exempt_if_contains: ["EXAMPLE"]
+    escalate_if:
+      entropy_gt: 3.5
+      escalated_action: elevate
+    notes: "AWS access key ID shape. FP mitigation, two mechanisms: (1) AWS's own documented placeholder (AKIAIOSFODNN7EXAMPLE) is exempted by the literal 'EXAMPLE' substring inside the matched span — this is the load-bearing check for that specific known case, not the entropy math below, since the placeholder's own measured entropy (~3.68 bits/char over the full 20-char match) sits close enough to a genuine random key's (~4.1+ bits/char observed) that entropy alone would be too thin a margin to trust here. (2) A structurally-real, high-entropy match (Shannon entropy over the full matched span > 3.5 bits/char) escalates flag -> elevate; a low-entropy hand-typed placeholder that isn't caught by (1) — e.g. a TESTTESTTESTTEST-style value in some other README — stays at flag. Base action stays flag for anything neither exempted nor high-entropy."
+
+  - id: SECRET-PEM-001
+    category: secret_exfiltration
+    severity: high
+    match:
+      type: regex
+      pattern: '-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----'
+    scope: tool_output_only
+    action: elevate
+    case_sensitive: true
+    notes: "PEM private key header. Low FP: this exact banner has no non-key legitimate use."
+
+  - id: SECRET-GH-001
+    category: secret_exfiltration
+    severity: medium
+    match:
+      type: regex
+      pattern: 'gh[pousr]_[A-Za-z0-9]{36,}'
+    scope: tool_output_only
+    action: flag
+    case_sensitive: true
+    notes: "GitHub PAT/OAuth/app token prefixes."
+
+  # ── command_execution ──────────────────────────────────────────────────
+  # Highest false-positive category — shell-pipe shapes are ubiquitous in
+  # legitimate install docs and Dockerfiles, so the pipe shape alone stays
+  # at flag/medium. The agent-directed shape (naming the reader's own
+  # tools in second person) is much rarer in legitimate content and is
+  # weighted higher.
+  - id: CEH-001
+    category: command_execution
+    severity: medium
+    match:
+      type: regex
+      pattern: 'curl\s+[^\n]{0,80}\|\s*(sudo\s+)?(ba|z)?sh\b'
+    scope: tool_output_only
+    action: flag
+    notes: "Shell-pipe install shape. Common in legitimate docs — never hard-block on this alone."
+
+  - id: CEH-002
+    category: command_execution
+    severity: high
+    match:
+      type: regex
+      pattern: '\b(now |please )?(run|execute|invoke)\b.{0,20}\b(the following|this)\b.{0,15}\b(command|script|tool)\b'
+    scope: tool_output_only
+    action: elevate
+    notes: "Agent-directed imperative — addresses the reader in 2nd person about invoking something. Legitimate tool output rarely does this."
+
+  - id: CEH-003
+    category: command_execution
+    severity: high
+    match:
+      type: regex
+      pattern: 'base64\s+-d\s*\|\s*sh'
+    scope: tool_output_only
+    action: elevate
+    notes: "Decode-then-execute shape, a common second-stage-payload pattern."
+
+  # ── encoding_smuggling ─────────────────────────────────────────────────
+  # Unicode Tag block smuggling is handled structurally by
+  # rules_engine::normalize_for_matching (decode-then-match against DSO/MCT/
+  # etc. rules above), not by a rule here — there is nothing left to match
+  # against after normalization decodes it back to plain text, which is the
+  # point. This rule catches long base64-looking runs as a weak, flag-only
+  # signal; a full decode-and-rescan pass is noted as follow-up work, not
+  # implemented yet.
+  - id: ENC-001
+    category: encoding_smuggling
+    severity: low
+    match:
+      type: regex
+      pattern: '[A-Za-z0-9+/]{80,}={0,2}'
+    scope: tool_output_only
+    action: flag
+    notes: "Long base64-charset run. Very common false-positive rate (binary blobs, images) — intentionally low severity, flag-only."
+
+  # ── covert_channel ─────────────────────────────────────────────────────
+  - id: EXF-BEACON-001
+    category: covert_channel
+    severity: high
+    match:
+      type: regex
+      pattern: '!\[[^\]]*\]\(https?://[^)]+\?[^)]{15,}\)'
+    scope: tool_output_only
+    action: elevate
+    notes: "Markdown image syntax with a long query string — the documented image-render exfiltration channel."
+
+  - id: EXF-WEBHOOK-001
+    category: covert_channel
+    severity: medium
+    match:
+      type: regex
+      pattern: '(webhook\.site|ngrok\.io|ngrok-free\.app|pipedream\.net|requestbin\.com)'
+    scope: tool_output_only
+    action: flag
+    notes: "Known out-of-band webhook/tunnel hosts. FP risk: legitimate developer tooling docs — flag-only."
+
+suppressions: []
