@@ -13,6 +13,11 @@ definitions, and a structural taint-tracking state machine over tool
 *responses* never a model call. If it blocks something, nothing downstream
 of it ever runs.
 
+**Before relying on this for anything, read [`THREAT_MODEL.md`](THREAT_MODEL.md)** —
+what this actually defends against, what it doesn't, and why. Found a gap
+between what that document claims and what the code does? See
+[`SECURITY.md`](SECURITY.md) for how to report it.
+
 ## Status
 
 This is a working v0.1, not a prototype that only compiles. Everything below
@@ -59,6 +64,11 @@ package, not simulated:
   a single one doesn't), the invariant that a `Poisoned` session never
   auto-recovers regardless of how much subsequent activity occurs, and
   the full replay/quota/authority/risk-budget rejection matrix.
+- `magus-gateway --version` and `magus-gateway --help` are real, tested
+  flags (`tests/cli_flags.rs`, spawning the actual compiled binary, not
+  calling internal functions) — added specifically because Homebrew's
+  formula test needs `--version` to work, but useful regardless of how
+  you installed it.
 
 What isn't done yet: dynamic (learned) server trust grading, more than one
 downstream server at a time in the demo config, a packaged binary release,
@@ -82,6 +92,10 @@ formula's own `rust` dependency.
 ### Build from source
 
 Requires Rust and Node (the demo downstream server is `npx`-launched).
+On Windows, if the gateway fails to spawn the demo server, change
+`command: "npx"` to `command: "npx.cmd"` in `config.yaml` — `npx` alone
+resolves differently there. This whole project has been built and tested
+on Windows this session, so this isn't a hypothetical edge case.
 
 ```bash
 git clone https://github.com/vahive-tobias/magus-opensecmcp.git
@@ -103,6 +117,9 @@ printf '%s\n' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/tmp/magus-demo/notes.txt"}}}' \
   | ./target/release/magus-gateway config.yaml
 ```
+
+`magus-gateway --version` and `magus-gateway --help` both work if you just
+want to confirm what's installed or see basic usage without a config file.
 
 No `user-rules.yaml` is required to run any of the above — `locked-rules.yaml`
 ships inside the binary and is active by default.
@@ -279,7 +296,14 @@ not merged like documentation. Contributions welcome — see below.
 - [ ] `SourceRegistry`-style dynamic grading (promotion/demotion over time)
       v1 intentionally ships static, config-set grades only.
 - [ ] More than one downstream server exercised in the shipped demo config.
-- [ ] Packaged release binaries / Homebrew tap.
+- [x] Homebrew tap — DONE. `vahive-tobias/homebrew-tap`, formula verified
+      (correct license, version, and a real tested tag/revision pin).
+      Genuinely unverified: an actual `brew install` run on real macOS —
+      neither this project's sandbox nor its Windows dev environment can
+      check that directly.
+- [ ] Packaged release binaries (e.g. prebuilt GitHub Release artifacts
+      for Linux/other platforms) — separate from the Homebrew tap above,
+      still not done.
 - [ ] More registry packs (GitHub, Postgres, Slack) verified against the
       real server before merge, per the contribution rule above.
 - [ ] Fuller normalization pipeline in `rules_engine.rs` — NFKC, TR39
