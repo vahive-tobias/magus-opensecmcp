@@ -452,17 +452,27 @@ async fn handle_tools_call(
     };
 
     let entry = registry.lookup(&mcp_server_id, tool_name);
+    // Resolved here, once, and reused below at the compute_new_state call
+    // site too — not a second lookup. Also feeds Proposal.source_grade for
+    // membrane.rs's Unvalidated BP surcharge (see
+    // docs/specs/spec-provenance-semantics-correction.md §4).
+    let server_grade = registry.server_config(&mcp_server_id)
+        .map(|c| c.source_grade)
+        .unwrap_or_default();
     let egress_bytes = serde_json::to_vec(&arguments).map(|b| b.len()).unwrap_or(0);
     let mut tracker = provenance_tracker.lock().await;
     let proposal = Proposal {
         id: Uuid::new_v4().to_string(),
         risk_class: entry.risk_class,
         authority_source: entry.authority_source,
-        // Gate on Contaminated, not Elevated: Elevated is the normal resting
-        // state for a routine structured response from a Known-graded server,
-        // so gating on it would reject nearly every call shortly after
-        // session start. Contaminated is rare and meaningful.
+        // Gate on Contaminated, not Elevated: under the corrected semantics,
+        // Contaminated means heuristic evidence actually fired (a rule hit),
+        // never just "external content was read" — Elevated is that normal
+        // resting state, so gating on it would reject nearly every call
+        // shortly after session start. See
+        // docs/specs/spec-provenance-semantics-correction.md.
         external_content_influence: tracker.current_state == provenance::ProvenanceState::Contaminated,
+        source_grade: server_grade,
         mcp_server_id: mcp_server_id.clone(),
         tool_name: tool_name.to_string(),
         bootstrap: entry.bootstrap,
@@ -513,10 +523,6 @@ async fn handle_tools_call(
                         },
                         None => SchemaConformance::NotDeclared,
                     };
-
-                    let server_grade = registry.server_config(&mcp_server_id)
-                        .map(|c| c.source_grade)
-                        .unwrap_or_default();
 
                     // Structural signals (source grade, response shape, size,
                     // schema conformance) and pattern-hit signals (rules.yaml)

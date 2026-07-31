@@ -2,7 +2,7 @@
 
 use serde::Serialize;
 
-use crate::registry::{RiskClass, SourceGrade};
+use crate::registry::SourceGrade;
 use crate::rules_engine::{Action, RuleHitSummary};
 
 /// Tri-state schema conformance to close the "no schema declared" loophole.
@@ -24,7 +24,24 @@ pub enum ResponseForm {
     Malformed,
 }
 
-/// The 4-tier provenance state of an agent's information environment.
+/// The 4-tier provenance state of an agent's information environment. Each
+/// state carries exactly one meaning — see
+/// docs/specs/spec-provenance-semantics-correction.md for the full
+/// rationale:
+///
+///   - `Clean`        — no external influence observed.
+///   - `Elevated`     — external content was consumed. No detection fired.
+///   - `Contaminated` — heuristic evidence fired. Uncorroborated. Recoverable.
+///   - `Poisoned`     — a deterministic violation, OR corroborated heuristic
+///                      evidence.
+///
+/// The `Contaminated`/`Poisoned` split is specifically heuristic vs.
+/// deterministic evidence, and it's load-bearing: a rule hit (heuristic) has
+/// a real false-positive class and needs corroboration before reaching
+/// `Poisoned` (see `state_from_rule_hits`); a schema violation or malformed
+/// response (deterministic — the tool's own contract was broken, or the
+/// payload didn't parse) has no false-positive class and goes straight to
+/// `Poisoned` (see `compute_new_state`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub enum ProvenanceState {
     Clean = 0,
@@ -123,10 +140,24 @@ pub fn compute_new_state(
 ) -> ProvenanceState {
     if response_form == ResponseForm::Malformed { return ProvenanceState::Poisoned; }
     if schema_conformance == SchemaConformance::Violated { return ProvenanceState::Poisoned; }
+    // Known, reasoned deviation, not an oversight: this is the same category
+    // error as the Unvalidated case below (a trust attribute producing a
+    // state), left alone this round. It's an explicit operator declaration
+    // rather than a default, changing it is a behavior change with no
+    // test-driven justification, and the real question it raises ("why is
+    // the gateway routing to a server the operator flagged as suspicious at
+    // all?") is a config-layer question, not an FSM one. See
+    // docs/specs/spec-provenance-semantics-correction.md §2.
     if source_grade == SourceGrade::Suspicious { return ProvenanceState::Poisoned; }
 
     if source_grade == SourceGrade::Unvalidated {
-        if response_form == ResponseForm::BareString { return ProvenanceState::Contaminated; }
+        // Response form no longer distinguishes here (BareString used to
+        // map to Contaminated). Source grade is a property of the SERVER;
+        // provenance state is a property of the session's information
+        // ENVIRONMENT — a trust attribute must not be able to manufacture
+        // evidence that was never actually observed. The compensating
+        // penalty for an ungraded source moved to the risk layer — see
+        // membrane.rs's Unvalidated BP surcharge.
         return ProvenanceState::Elevated;
     }
 
@@ -151,7 +182,8 @@ pub fn compute_new_state(
 ///   - `action` (flag | elevate | poison), set explicitly per rule in
 ///     rules.yaml, is the DIRECT consequence of that specific rule firing.
 ///     A `poison` action always poisons immediately; an `elevate` action
-///     elevates on first occurrence.
+///     produces `Contaminated` on first occurrence — heuristic evidence,
+///     uncorroborated, recoverable — not `Poisoned` outright.
 ///   - `severity`, used below via `RuleHitSummary`'s counting methods, is
 ///     the CORROBORATION weight: it's what lets several individually
 ///     medium-confidence hits across different categories in one response
@@ -160,14 +192,19 @@ pub fn compute_new_state(
 ///     that interaction.
 ///
 /// The corroboration rule this function also enforces — a second
-/// elevate-or-stronger signal while the session is ALREADY at Elevated
-/// escalates all the way to Poisoned — exists because one elevate-strength
+/// elevate-or-stronger signal while the session is ALREADY `Contaminated`
+/// escalates all the way to `Poisoned` — exists because one elevate-strength
 /// signal shouldn't fully poison a session on its own (that's what a
-/// `poison` action is for), but two independent ones, on two different tool
-/// calls or within the same response, should. Only the tracker's current
-/// state can tell us whether this is the first such signal or the second,
-/// which is why this takes `current_state` as an argument rather than being
-/// a pure function of the summary alone.
+/// `poison` action is for; it's also why the threshold is `>= Contaminated`
+/// rather than `>= Elevated` — `Elevated` is the normal resting state for a
+/// session that has merely read anything, so gating corroboration on it
+/// would let a single ambiguous hit, like the security-blogpost false
+/// positive `tests/fixtures/should_not_poison/` covers, poison a session
+/// outright). Two independent heuristic signals, on two different tool
+/// calls or within the same response, should poison. Only the tracker's
+/// current state can tell us whether this is the first such signal or the
+/// second, which is why this takes `current_state` as an argument rather
+/// than being a pure function of the summary alone.
 pub fn state_from_rule_hits(summary: &RuleHitSummary, current_state: ProvenanceState) -> ProvenanceState {
     if summary.hits.iter().any(|h| h.action == Action::Poison) {
         return ProvenanceState::Poisoned;
@@ -178,10 +215,10 @@ pub fn state_from_rule_hits(summary: &RuleHitSummary, current_state: ProvenanceS
         && summary.medium_or_above_count() >= crate::rules_engine::SYNTHESIS_MIN_HITS;
 
     if has_elevate || synthesized_elevate {
-        return if current_state >= ProvenanceState::Elevated {
+        return if current_state >= ProvenanceState::Contaminated {
             ProvenanceState::Poisoned
         } else {
-            ProvenanceState::Elevated
+            ProvenanceState::Contaminated
         };
     }
 
@@ -256,30 +293,6 @@ impl Default for AgentProvenanceTracker {
     fn default() -> Self { Self::new() }
 }
 
-/// Modulates a proposal's risk class based on the current tracker state, and
-/// enforces the Critical gate: any Critical action requires Clean provenance,
-/// full stop, independent of BP budget. This is what keeps the worst-tier
-/// action safe even if DECAY_MULTIPLIER's calibration turns out to be wrong.
-pub fn modulate_risk_class(
-    proposal_risk: &mut RiskClass,
-    state: &ProvenanceState,
-) -> Result<(), &'static str> {
-    match (*proposal_risk, *state) {
-        (_, ProvenanceState::Clean) => {}
-        (RiskClass::High, ProvenanceState::Elevated) => *proposal_risk = RiskClass::Critical,
-        (RiskClass::Medium, ProvenanceState::Contaminated) => *proposal_risk = RiskClass::High,
-        (RiskClass::High, ProvenanceState::Contaminated) => *proposal_risk = RiskClass::Critical,
-        (_, ProvenanceState::Poisoned) => return Err("InboundPoisoningDetected"),
-        _ => {}
-    }
-
-    if *proposal_risk == RiskClass::Critical && *state != ProvenanceState::Clean {
-        return Err("CriticalBlockedByProvenance");
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,6 +328,29 @@ mod tests {
         }
     }
 
+    /// Demonstrates the heuristic/deterministic split concretely: a schema
+    /// violation reaches Poisoned in one shot, straight from Clean, for a
+    /// grade (Attested) that would otherwise need TWO corroborating
+    /// heuristic signals via state_from_rule_hits to get there. A
+    /// deterministic contract breach has no false-positive class and needs
+    /// no corroboration — unlike a rule hit, which does (see
+    /// single_heuristic_hit_from_elevated_produces_contaminated_not_poisoned).
+    #[test]
+    fn deterministic_schema_violation_poisons_directly_with_no_corroboration_needed() {
+        let state = compute_new_state(
+            SourceGrade::Attested,
+            ResponseForm::StructuredContainer,
+            SchemaConformance::Violated,
+            10,
+            0,
+        );
+        assert_eq!(
+            state,
+            ProvenanceState::Poisoned,
+            "a schema violation must poison directly from Clean-eligible inputs, with no corroboration step"
+        );
+    }
+
     #[test]
     fn suspicious_source_grade_is_always_poisoned_regardless_of_response_form() {
         for form in [ResponseForm::PrimitiveData, ResponseForm::StructuredContainer, ResponseForm::BareString, ResponseForm::BareArray] {
@@ -324,9 +360,13 @@ mod tests {
     }
 
     #[test]
-    fn unvalidated_bare_string_is_contaminated() {
+    fn unvalidated_bare_string_is_elevated() {
+        // Was Contaminated: source grade (a server property) must not be
+        // able to manufacture evidence the session's information
+        // environment never actually produced. See §2 of
+        // spec-provenance-semantics-correction.md.
         let state = compute_new_state(SourceGrade::Unvalidated, ResponseForm::BareString, SchemaConformance::NotDeclared, 0, 0);
-        assert_eq!(state, ProvenanceState::Contaminated);
+        assert_eq!(state, ProvenanceState::Elevated);
     }
 
     #[test]
@@ -425,38 +465,58 @@ mod tests {
     }
 
     #[test]
-    fn single_elevate_hit_from_clean_becomes_elevated() {
+    fn single_elevate_hit_from_clean_becomes_contaminated() {
         let summary = RuleHitSummary { hits: vec![hit("R-1", "cat", Severity::High, Action::Elevate)] };
-        assert_eq!(state_from_rule_hits(&summary, ProvenanceState::Clean), ProvenanceState::Elevated);
+        assert_eq!(state_from_rule_hits(&summary, ProvenanceState::Clean), ProvenanceState::Contaminated);
+    }
+
+    /// THE regression guard for this change. A single heuristic hit must
+    /// land on Contaminated — heuristic, uncorroborated, recoverable — even
+    /// when the session is already Elevated (the normal resting state for
+    /// any session that has merely read something). If this collapses back
+    /// to Poisoned, the corroboration threshold silently reverted to
+    /// `>= Elevated`, and a single DSO-001 match — including the
+    /// security-blogpost false positive
+    /// tests/fixtures/should_not_poison/security_blogpost_excerpt.md
+    /// deliberately covers — would poison a session outright. Nothing else
+    /// in this suite would catch that regression; the name is deliberately
+    /// explicit so a failure here says exactly what broke.
+    #[test]
+    fn single_heuristic_hit_from_elevated_produces_contaminated_not_poisoned() {
+        let summary = RuleHitSummary { hits: vec![hit("R-1", "cat", Severity::High, Action::Elevate)] };
+        assert_eq!(
+            state_from_rule_hits(&summary, ProvenanceState::Elevated),
+            ProvenanceState::Contaminated,
+            "a single heuristic hit from Elevated must land on Contaminated, NOT Poisoned — \
+             Elevated is the normal resting state for any session that has read anything, so \
+             corroborating against it would poison on a single ambiguous signal"
+        );
     }
 
     /// THE corroboration case: a second elevate-strength signal while the
-    /// session is ALREADY Elevated must poison the session, not just hold
-    /// it at Elevated. Kept as its own dedicated test per
+    /// session is ALREADY Contaminated must poison the session, not just
+    /// hold it at Contaminated. Kept as its own dedicated test per
     /// docs/specs/spec-fsm-test-coverage.md, which calls this the single
     /// most important case in this file — a failure here must not be
     /// hideable inside a broader scenario.
     #[test]
-    fn corroboration_second_elevate_signal_while_already_elevated_poisons() {
-        let summary = RuleHitSummary { hits: vec![hit("R-1", "cat", Severity::High, Action::Elevate)] };
-        assert_eq!(state_from_rule_hits(&summary, ProvenanceState::Elevated), ProvenanceState::Poisoned);
-    }
-
-    /// Documents actual (not assumed) behavior for the two remaining
-    /// current_state inputs. Per the code: `has_elevate` is true and
-    /// `current_state >= Elevated` is true for BOTH Contaminated and
-    /// Poisoned, so this function returns Poisoned for both — it does NOT
-    /// return something lower than current_state on this path
-    /// (Contaminated(2) -> Poisoned(3) is a further escalation, not a
-    /// regression). The "may return lower than current_state" risk the
-    /// spec asks to check for does not materialize here; it DOES
-    /// materialize on the flag-only path below, which is why main.rs's
-    /// `.max(structural_state, hit_state)` matters — see
-    /// `flag_only_hits_return_clean_regardless_of_current_state`.
-    #[test]
-    fn single_elevate_hit_from_contaminated_or_poisoned_stays_at_poisoned() {
+    fn corroboration_second_elevate_signal_while_already_contaminated_poisons() {
         let summary = RuleHitSummary { hits: vec![hit("R-1", "cat", Severity::High, Action::Elevate)] };
         assert_eq!(state_from_rule_hits(&summary, ProvenanceState::Contaminated), ProvenanceState::Poisoned);
+    }
+
+    /// Documents actual (not assumed) behavior for the remaining
+    /// current_state input. Per the code: `has_elevate` is true and
+    /// `current_state >= Contaminated` is true for Poisoned too, so this
+    /// function returns Poisoned for it — it does NOT return something
+    /// lower than current_state on this path. The "may return lower than
+    /// current_state" risk the spec asks to check for does not materialize
+    /// here; it DOES materialize on the flag-only path below, which is why
+    /// main.rs's `.max(structural_state, hit_state)` matters — see
+    /// `flag_only_hits_return_clean_regardless_of_current_state`.
+    #[test]
+    fn single_elevate_hit_from_poisoned_stays_at_poisoned() {
+        let summary = RuleHitSummary { hits: vec![hit("R-1", "cat", Severity::High, Action::Elevate)] };
         assert_eq!(state_from_rule_hits(&summary, ProvenanceState::Poisoned), ProvenanceState::Poisoned);
     }
 
@@ -544,13 +604,13 @@ mod tests {
 
         assert_eq!(
             state_from_rule_hits(&summary, ProvenanceState::Clean),
-            ProvenanceState::Elevated,
-            "at-threshold synthesis from Clean must elevate, same as a direct Elevate hit"
+            ProvenanceState::Contaminated,
+            "at-threshold synthesis from Clean must produce Contaminated, same as a direct Elevate hit"
         );
         assert_eq!(
-            state_from_rule_hits(&summary, ProvenanceState::Elevated),
+            state_from_rule_hits(&summary, ProvenanceState::Contaminated),
             ProvenanceState::Poisoned,
-            "at-threshold synthesis while already Elevated must poison, same as a direct Elevate hit"
+            "at-threshold synthesis while already Contaminated must poison, same as a direct Elevate hit"
         );
     }
 
@@ -662,90 +722,5 @@ mod tests {
             "accumulated bytes exactly at threshold must not decay (the check is strictly greater-than)"
         );
         assert_eq!(tracker.bytes_since_elevation, threshold);
-    }
-
-    // ---- modulate_risk_class ----
-
-    #[test]
-    fn clean_state_never_changes_risk_class_for_any_variant() {
-        for risk in [RiskClass::Low, RiskClass::Medium, RiskClass::High, RiskClass::Critical] {
-            let mut r = risk;
-            let result = modulate_risk_class(&mut r, &ProvenanceState::Clean);
-            assert!(result.is_ok(), "Clean must never block, got {:?} for risk {:?}", result, risk);
-            assert_eq!(r, risk, "Clean must never change the risk class, got {:?} for original {:?}", r, risk);
-        }
-    }
-
-    #[test]
-    fn high_elevated_bumps_to_critical() {
-        // The bump table takes (High, Elevated) to Critical, but Elevated
-        // != Clean, so the Critical-block gate then fires too — same
-        // shape as (High, Contaminated) below. The risk class still ends
-        // up Critical; the call still errors.
-        let mut r = RiskClass::High;
-        let result = modulate_risk_class(&mut r, &ProvenanceState::Elevated);
-        assert_eq!(result, Err("CriticalBlockedByProvenance"), "bumping to Critical under a non-Clean state must then trip the Critical gate");
-        assert_eq!(r, RiskClass::Critical);
-    }
-
-    #[test]
-    fn medium_contaminated_bumps_to_high() {
-        let mut r = RiskClass::Medium;
-        let result = modulate_risk_class(&mut r, &ProvenanceState::Contaminated);
-        assert!(result.is_ok(), "bumping Medium->High under Contaminated must not itself be blocked");
-        assert_eq!(r, RiskClass::High);
-    }
-
-    #[test]
-    fn high_contaminated_bumps_to_critical() {
-        let mut r = RiskClass::High;
-        let result = modulate_risk_class(&mut r, &ProvenanceState::Contaminated);
-        assert_eq!(result, Err("CriticalBlockedByProvenance"), "bumping to Critical under a non-Clean state must then trip the Critical gate");
-        assert_eq!(r, RiskClass::Critical, "the bump to Critical must still have applied even though the call then errors");
-    }
-
-    #[test]
-    fn low_is_exempt_from_the_bump_table_under_elevated_and_contaminated() {
-        for state in [ProvenanceState::Elevated, ProvenanceState::Contaminated] {
-            let mut r = RiskClass::Low;
-            let result = modulate_risk_class(&mut r, &state);
-            assert!(result.is_ok(), "Low must not be blocked under {:?}", state);
-            assert_eq!(r, RiskClass::Low, "Low must not be bumped by a catch-all arm under {:?}", state);
-        }
-    }
-
-    #[test]
-    fn poisoned_blocks_every_risk_class_including_low() {
-        for risk in [RiskClass::Low, RiskClass::Medium, RiskClass::High, RiskClass::Critical] {
-            let mut r = risk;
-            let result = modulate_risk_class(&mut r, &ProvenanceState::Poisoned);
-            assert_eq!(result, Err("InboundPoisoningDetected"), "Poisoned must block risk class {:?} too, not just High/Critical", risk);
-        }
-    }
-
-    #[test]
-    fn critical_block_fires_after_the_bump_not_before() {
-        // (Medium, Contaminated) bumps to High, NOT Critical — must NOT
-        // trip the Critical-block path.
-        let mut medium = RiskClass::Medium;
-        assert!(modulate_risk_class(&mut medium, &ProvenanceState::Contaminated).is_ok());
-        assert_eq!(medium, RiskClass::High);
-
-        // (High, Contaminated) bumps to Critical — MUST then trip it.
-        let mut high = RiskClass::High;
-        assert_eq!(
-            modulate_risk_class(&mut high, &ProvenanceState::Contaminated),
-            Err("CriticalBlockedByProvenance")
-        );
-        assert_eq!(high, RiskClass::Critical);
-    }
-
-    #[test]
-    fn originally_critical_risk_class_with_non_clean_state_is_blocked() {
-        for state in [ProvenanceState::Elevated, ProvenanceState::Contaminated] {
-            let mut r = RiskClass::Critical;
-            let result = modulate_risk_class(&mut r, &state);
-            assert_eq!(result, Err("CriticalBlockedByProvenance"), "an originally-Critical risk class under {:?} must be blocked", state);
-        }
     }
 }

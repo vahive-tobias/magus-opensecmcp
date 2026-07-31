@@ -45,6 +45,32 @@ its classified risk. There is no override, no LLM re-judgment, no
 retry-with-different-framing path around this — it's a plain state
 comparison.
 
+The four states each carry exactly one meaning, with one documented
+exception: `SourceGrade::Suspicious` still forces `Poisoned` directly,
+independent of any observed evidence. That carve-out is deliberate, not an
+oversight — it's an explicit administrative trust assertion (the operator
+declared this server suspicious in `config.yaml`) rather than something
+inferred from runtime evidence, and it's left in place rather than
+generalized into the classification logic; see the comment at that check in
+`provenance.rs` for the full reasoning. Elsewhere, the split between the
+middle two states is the one worth understanding precisely: `Clean` — no
+external influence observed. `Elevated` — external content was consumed,
+but nothing was detected; this is the normal resting state for a routine
+call against a graded server, not itself a signal. `Contaminated` —
+heuristic evidence fired: a rule hit, uncorroborated, recoverable.
+`Poisoned` — either a deterministic contract breach (a declared
+`outputSchema` violated, or a response that didn't even parse) or
+corroborated heuristic evidence (a second independent signal while already
+`Contaminated`). The
+`Contaminated`/`Poisoned` split is specifically heuristic vs. deterministic
+evidence: a rule hit has a real false-positive class — see
+`tests/fixtures/should_not_poison/security_blogpost_excerpt.md`, which
+exists precisely because a legitimate security write-up can match a
+signature — so it earns corroboration before reaching the capability gate's
+full force. A schema violation or an unparseable payload has no
+false-positive class; there is nothing to corroborate, so it poisons
+directly.
+
 ## What this defends against
 
 **Tool definition tampering ("rug-pull") between discovery and use.**

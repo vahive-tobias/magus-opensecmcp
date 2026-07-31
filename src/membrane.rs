@@ -1,9 +1,9 @@
 // src/membrane.rs
 
 use crate::audit::{AuditLogger, AuditRecord};
-use crate::provenance::{modulate_risk_class, AgentProvenanceTracker};
+use crate::provenance::{AgentProvenanceTracker, ProvenanceState};
 use crate::quota::QuotaCounter;
-use crate::registry::{AuthoritySource, RiskClass};
+use crate::registry::{AuthoritySource, RiskClass, SourceGrade};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -19,6 +19,12 @@ pub struct Proposal {
     pub risk_class: RiskClass,
     pub authority_source: AuthoritySource,
     pub external_content_influence: bool,
+    /// The downstream server's static trust grade, resolved once at
+    /// proposal-construction time (main.rs already looks this up for
+    /// `compute_new_state`; this reuses that same value rather than a new
+    /// lookup). Used for the Unvalidated BP surcharge below — see
+    /// docs/specs/spec-provenance-semantics-correction.md §4.
+    pub source_grade: SourceGrade,
     pub mcp_server_id: String,
     pub tool_name: String,
     #[serde(default)]
@@ -38,6 +44,14 @@ pub struct Proposal {
 #[derive(Debug, Clone, PartialEq)]
 pub enum RejectionCode {
     ReplayDetected,
+    /// No longer produced (see §5 of
+    /// docs/specs/spec-provenance-semantics-correction.md — the predicate
+    /// this named, `external_content_influence && authority_source ==
+    /// User`, described a threat model this project doesn't have:
+    /// `authority_source` is a static per-tool registry property here, never
+    /// a per-call agent claim, so nothing was actually being laundered).
+    /// Kept as a variant so historical `audit.jsonl` records referencing it
+    /// stay readable.
     AuthorityLaundering,
     ExternalAuthorityViolation,
     RiskFloorExceeded,
@@ -62,6 +76,35 @@ impl RejectionCode {
             RejectionCode::EvaluationLimitReached => "EvaluationLimitReached",
         }
     }
+}
+
+/// Modulates a proposal's risk class based on the current tracker state, and
+/// enforces the Critical gate: any Critical action requires Clean provenance,
+/// full stop, independent of BP budget. This is what keeps the worst-tier
+/// action safe even if DECAY_MULTIPLIER's calibration turns out to be wrong.
+///
+/// Relocated here from provenance.rs (pure move, no behavior change) — it
+/// takes a `RiskClass` and returns an operational rejection, which is a
+/// decision, not an observation about the information environment; see
+/// docs/specs/spec-provenance-semantics-correction.md §6.
+pub fn modulate_risk_class(
+    proposal_risk: &mut RiskClass,
+    state: &ProvenanceState,
+) -> Result<(), &'static str> {
+    match (*proposal_risk, *state) {
+        (_, ProvenanceState::Clean) => {}
+        (RiskClass::High, ProvenanceState::Elevated) => *proposal_risk = RiskClass::Critical,
+        (RiskClass::Medium, ProvenanceState::Contaminated) => *proposal_risk = RiskClass::High,
+        (RiskClass::High, ProvenanceState::Contaminated) => *proposal_risk = RiskClass::Critical,
+        (_, ProvenanceState::Poisoned) => return Err("InboundPoisoningDetected"),
+        _ => {}
+    }
+
+    if *proposal_risk == RiskClass::Critical && *state != ProvenanceState::Clean {
+        return Err("CriticalBlockedByProvenance");
+    }
+
+    Ok(())
 }
 
 pub struct Membrane {
@@ -128,10 +171,13 @@ impl Membrane {
             return Err(code);
         }
 
-        if proposal.external_content_influence && proposal.authority_source == AuthoritySource::User {
-            self.record_rejection(proposal, connection_id, tracker, audit, RejectionCode::AuthorityLaundering, 0);
-            return Err(RejectionCode::AuthorityLaundering);
-        }
+        // AuthorityLaundering rejection retired here — see the
+        // RejectionCode::AuthorityLaundering variant's own comment and
+        // docs/specs/spec-provenance-semantics-correction.md §5. The 135%
+        // surcharge below is the correct, proportionate response to
+        // heuristic evidence; a hard block on every User-authority action
+        // for the rest of the session was not, once Contaminated became
+        // reachable.
         if proposal.authority_source == AuthoritySource::External && effective_risk == RiskClass::Critical {
             self.record_rejection(proposal, connection_id, tracker, audit, RejectionCode::ExternalAuthorityViolation, 0);
             return Err(RejectionCode::ExternalAuthorityViolation);
@@ -144,11 +190,29 @@ impl Membrane {
             RiskClass::High => 2_000,
             RiskClass::Critical => 4_000,
         };
-        let contribution_bp = if proposal.external_content_influence {
-            (base_bp * 135) / 100
-        } else {
-            base_bp
-        };
+        // Two independent surcharges, stacking multiplicatively when both
+        // apply. external_content_influence (135%) is the existing
+        // heuristic-evidence surcharge. The Unvalidated surcharge (150%) is
+        // new here: it's what compensates for removing
+        // Unvalidated + BareString -> Contaminated from provenance.rs's
+        // compute_new_state (a trust attribute must not manufacture
+        // evidence the session's information environment never actually
+        // observed) — without it, the default configuration a first-time
+        // user gets would quietly lose protection. 150% is a CALIBRATION
+        // GUESS, not asserted as correct: chosen to sit in the same range
+        // as the 135% surcharge while being somewhat stronger, since an
+        // ungraded source is a broader concern than a single flagged
+        // response. Revisit with evidence, the way SECRET-AWS-001's
+        // threshold was revisited once the corpus test produced a real
+        // failing case — see
+        // docs/specs/spec-provenance-semantics-correction.md §4.
+        let mut contribution_bp = base_bp;
+        if proposal.external_content_influence {
+            contribution_bp = (contribution_bp * 135) / 100;
+        }
+        if proposal.source_grade == SourceGrade::Unvalidated {
+            contribution_bp = (contribution_bp * 150) / 100;
+        }
 
         if agent_bp + contribution_bp >= RISK_FLOOR_BP {
             self.record_rejection(proposal, connection_id, tracker, audit, RejectionCode::RiskFloorExceeded, agent_bp);
@@ -219,7 +283,6 @@ impl Membrane {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provenance::ProvenanceState;
     use std::path::PathBuf;
 
     fn temp_audit_path() -> PathBuf {
@@ -232,6 +295,10 @@ mod tests {
         Membrane::new("test-session".to_string(), max_agents, monthly_limit)
     }
 
+    /// source_grade defaults to Known — a graded server, so it never
+    /// triggers the Unvalidated surcharge by accident in tests that aren't
+    /// specifically about it. Tests that need Unvalidated set
+    /// `.source_grade` directly on the returned Proposal.
     fn make_proposal(
         id: &str,
         risk_class: RiskClass,
@@ -243,6 +310,7 @@ mod tests {
             risk_class,
             authority_source,
             external_content_influence,
+            source_grade: SourceGrade::Known,
             mcp_server_id: "server-a".to_string(),
             tool_name: "tool-a".to_string(),
             bootstrap: false,
@@ -286,17 +354,77 @@ mod tests {
         assert_eq!(result, Err(RejectionCode::EvaluationLimitReached));
     }
 
+    /// §5's retirement, asserted directly: a User-authority proposal with
+    /// external_content_influence must be APPROVED, not rejected — this
+    /// exact (authority_source, external_content_influence) combination
+    /// used to be an automatic AuthorityLaundering rejection. Asserting the
+    /// removal, not just its absence, so a regression back to the old
+    /// blunt block is a visible test failure, not a silent revival.
     #[test]
-    fn authority_laundering_external_influence_plus_user_authority_is_rejected() {
+    fn user_authority_with_external_content_influence_is_approved_not_rejected() {
         let mut membrane = make_membrane(3, 5000);
         let connection_id = Uuid::new_v4();
         membrane.register_agent(connection_id).unwrap();
         let mut tracker = AgentProvenanceTracker::new();
         let audit = AuditLogger::new_with_path(temp_audit_path(), "test-session");
 
-        let proposal = make_proposal("prop-1", RiskClass::Low, AuthoritySource::User, true);
+        let proposal = make_proposal("prop-1", RiskClass::Medium, AuthoritySource::User, true);
         let result = membrane.evaluate(&proposal, connection_id, &mut tracker, &audit);
-        assert_eq!(result, Err(RejectionCode::AuthorityLaundering));
+        assert!(result.is_ok(), "must be approved under the retired check, got {:?}", result);
+
+        // Still costs the 135% surcharge — retiring the hard block doesn't
+        // mean external_content_influence goes unpriced.
+        let expected_bp = SESSION_INIT_BP + (800 * 135) / 100;
+        assert_eq!(
+            *membrane.agent_accumulators.get(&connection_id).unwrap(),
+            expected_bp,
+            "the 135% surcharge must still apply even though the hard rejection is gone"
+        );
+    }
+
+    /// §4's Unvalidated BP surcharge, compensating for removing
+    /// Unvalidated + BareString -> Contaminated from provenance.rs.
+    #[test]
+    fn unvalidated_source_grade_costs_more_bp_than_known() {
+        let mut membrane = make_membrane(3, 5000);
+        let connection_id = Uuid::new_v4();
+        membrane.register_agent(connection_id).unwrap();
+        let mut tracker = AgentProvenanceTracker::new();
+        let audit = AuditLogger::new_with_path(temp_audit_path(), "test-session");
+
+        let mut proposal = make_proposal("prop-1", RiskClass::Medium, AuthoritySource::User, false);
+        proposal.source_grade = SourceGrade::Unvalidated;
+        let result = membrane.evaluate(&proposal, connection_id, &mut tracker, &audit);
+        assert!(result.is_ok());
+
+        let expected_bp = SESSION_INIT_BP + (800 * 150) / 100;
+        assert_eq!(
+            *membrane.agent_accumulators.get(&connection_id).unwrap(),
+            expected_bp,
+            "Unvalidated must cost 150% of the base BP, not the flat base amount"
+        );
+    }
+
+    /// Both surcharges stack multiplicatively when both apply, per §4.
+    #[test]
+    fn external_content_influence_and_unvalidated_surcharges_stack_multiplicatively() {
+        let mut membrane = make_membrane(3, 5000);
+        let connection_id = Uuid::new_v4();
+        membrane.register_agent(connection_id).unwrap();
+        let mut tracker = AgentProvenanceTracker::new();
+        let audit = AuditLogger::new_with_path(temp_audit_path(), "test-session");
+
+        let mut proposal = make_proposal("prop-1", RiskClass::Medium, AuthoritySource::System, true);
+        proposal.source_grade = SourceGrade::Unvalidated;
+        let result = membrane.evaluate(&proposal, connection_id, &mut tracker, &audit);
+        assert!(result.is_ok());
+
+        let expected_bp = SESSION_INIT_BP + (((800 * 135) / 100) * 150) / 100;
+        assert_eq!(
+            *membrane.agent_accumulators.get(&connection_id).unwrap(),
+            expected_bp,
+            "both surcharges must stack multiplicatively, not just apply the larger one"
+        );
     }
 
     #[test]
@@ -499,5 +627,94 @@ mod tests {
             membrane.register_agent(Uuid::new_v4()).is_ok(),
             "deregistering must free a slot for a new registration"
         );
+    }
+
+    // ---- modulate_risk_class ----
+    // Relocated from provenance.rs (pure move, no behavior change) — see
+    // docs/specs/spec-provenance-semantics-correction.md §6. Unchanged in
+    // content; if any of these needed its assertions altered to pass after
+    // the move, something else went wrong.
+
+    #[test]
+    fn clean_state_never_changes_risk_class_for_any_variant() {
+        for risk in [RiskClass::Low, RiskClass::Medium, RiskClass::High, RiskClass::Critical] {
+            let mut r = risk;
+            let result = modulate_risk_class(&mut r, &ProvenanceState::Clean);
+            assert!(result.is_ok(), "Clean must never block, got {:?} for risk {:?}", result, risk);
+            assert_eq!(r, risk, "Clean must never change the risk class, got {:?} for original {:?}", r, risk);
+        }
+    }
+
+    #[test]
+    fn high_elevated_bumps_to_critical() {
+        // The bump table takes (High, Elevated) to Critical, but Elevated
+        // != Clean, so the Critical-block gate then fires too — same
+        // shape as (High, Contaminated) below. The risk class still ends
+        // up Critical; the call still errors.
+        let mut r = RiskClass::High;
+        let result = modulate_risk_class(&mut r, &ProvenanceState::Elevated);
+        assert_eq!(result, Err("CriticalBlockedByProvenance"), "bumping to Critical under a non-Clean state must then trip the Critical gate");
+        assert_eq!(r, RiskClass::Critical);
+    }
+
+    #[test]
+    fn medium_contaminated_bumps_to_high() {
+        let mut r = RiskClass::Medium;
+        let result = modulate_risk_class(&mut r, &ProvenanceState::Contaminated);
+        assert!(result.is_ok(), "bumping Medium->High under Contaminated must not itself be blocked");
+        assert_eq!(r, RiskClass::High);
+    }
+
+    #[test]
+    fn high_contaminated_bumps_to_critical() {
+        let mut r = RiskClass::High;
+        let result = modulate_risk_class(&mut r, &ProvenanceState::Contaminated);
+        assert_eq!(result, Err("CriticalBlockedByProvenance"), "bumping to Critical under a non-Clean state must then trip the Critical gate");
+        assert_eq!(r, RiskClass::Critical, "the bump to Critical must still have applied even though the call then errors");
+    }
+
+    #[test]
+    fn low_is_exempt_from_the_bump_table_under_elevated_and_contaminated() {
+        for state in [ProvenanceState::Elevated, ProvenanceState::Contaminated] {
+            let mut r = RiskClass::Low;
+            let result = modulate_risk_class(&mut r, &state);
+            assert!(result.is_ok(), "Low must not be blocked under {:?}", state);
+            assert_eq!(r, RiskClass::Low, "Low must not be bumped by a catch-all arm under {:?}", state);
+        }
+    }
+
+    #[test]
+    fn poisoned_blocks_every_risk_class_including_low() {
+        for risk in [RiskClass::Low, RiskClass::Medium, RiskClass::High, RiskClass::Critical] {
+            let mut r = risk;
+            let result = modulate_risk_class(&mut r, &ProvenanceState::Poisoned);
+            assert_eq!(result, Err("InboundPoisoningDetected"), "Poisoned must block risk class {:?} too, not just High/Critical", risk);
+        }
+    }
+
+    #[test]
+    fn critical_block_fires_after_the_bump_not_before() {
+        // (Medium, Contaminated) bumps to High, NOT Critical — must NOT
+        // trip the Critical-block path.
+        let mut medium = RiskClass::Medium;
+        assert!(modulate_risk_class(&mut medium, &ProvenanceState::Contaminated).is_ok());
+        assert_eq!(medium, RiskClass::High);
+
+        // (High, Contaminated) bumps to Critical — MUST then trip it.
+        let mut high = RiskClass::High;
+        assert_eq!(
+            modulate_risk_class(&mut high, &ProvenanceState::Contaminated),
+            Err("CriticalBlockedByProvenance")
+        );
+        assert_eq!(high, RiskClass::Critical);
+    }
+
+    #[test]
+    fn originally_critical_risk_class_with_non_clean_state_is_blocked() {
+        for state in [ProvenanceState::Elevated, ProvenanceState::Contaminated] {
+            let mut r = RiskClass::Critical;
+            let result = modulate_risk_class(&mut r, &state);
+            assert_eq!(result, Err("CriticalBlockedByProvenance"), "an originally-Critical risk class under {:?} must be blocked", state);
+        }
     }
 }
