@@ -162,7 +162,14 @@ fn first_run_no_pin_tool_is_not_quarantined_and_is_callable() {
 
     let call = find_response(&responses, 3);
     assert!(call.get("error").is_none(), "unpinned tool must be callable, got error: {call:?}");
-    assert_eq!(call["result"]["content"][0]["text"], "pong");
+    // starts_with, not an exact match: this is a fresh session's first call
+    // against a Known-graded server, which genuinely escalates Clean ->
+    // Elevated on structural signal alone (see provenance::compute_new_state)
+    // and now legitimately gets a SEC-01 advisory appended as a result —
+    // this test is about pin enforcement, not about asserting the response
+    // is byte-for-byte untouched.
+    let text = call["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.starts_with("pong"), "got: {text:?}");
 }
 
 #[test]

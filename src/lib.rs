@@ -7,6 +7,7 @@
 // now a binary that depends on this library crate instead of declaring
 // these modules itself; nothing about the modules' own code changed.
 
+pub mod advisory;
 pub mod audit;
 pub mod downstream;
 pub mod hasher;

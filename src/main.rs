@@ -11,6 +11,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+use magus_opensecmcp::advisory;
 use magus_opensecmcp::audit::AuditLogger;
 use magus_opensecmcp::downstream::DownstreamConnection;
 use magus_opensecmcp::hasher::{compute_definition_hash, hash_to_hex, McpToolDefinition};
@@ -484,7 +485,7 @@ async fn handle_tools_call(
             drop(conn);
 
             match call_result {
-                Ok((real_result, ingress_bytes)) => {
+                Ok((mut real_result, ingress_bytes)) => {
                     let raw_bytes = serde_json::to_vec(&real_result).unwrap_or_default();
                     let (form, _sc, long_sc, total_bytes, combined_text) = provenance::classify_response(&raw_bytes);
                     // No downstream-declared output schema means this stays
@@ -530,7 +531,26 @@ async fn handle_tools_call(
                     let hit_state = provenance::state_from_rule_hits(&hit_summary, tracker.current_state);
 
                     let new_state = structural_state.max(hit_state);
+                    // Captured before ingest_signature so the "did THIS
+                    // response actually escalate anything" check below is
+                    // exact, not approximate: ingest_signature already only
+                    // mutates current_state on a strict increase (see its
+                    // own doc comment), so comparing before/after here is
+                    // reading that existing semantics, not adding a second,
+                    // separate noise-suppression mechanism on top of it.
+                    let state_before = tracker.current_state;
                     tracker.ingest_signature(new_state, ingress_bytes, &mcp_server_id, &hit_summary.rule_ids());
+
+                    // SEC-01: only inject when this specific call caused a
+                    // genuine escalation, not on every subsequent call while
+                    // the session merely remains at an already-elevated
+                    // state — see advisory.rs for the tier fallback and its
+                    // honesty distinction (tier 1 proven, tiers 2/3 reasoned
+                    // extensions of the same principle).
+                    if tracker.current_state > state_before {
+                        let advisory_text = advisory::build_advisory_text(tracker.current_state, &hit_summary.rule_ids());
+                        advisory::inject_advisory(&mut real_result, &advisory_text);
+                    }
 
                     serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": real_result })
                 }
