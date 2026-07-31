@@ -368,11 +368,16 @@ async fn handle_tools_call(
 
     let entry = registry.lookup(&mcp_server_id, tool_name);
     let egress_bytes = serde_json::to_vec(&arguments).map(|b| b.len()).unwrap_or(0);
+    let mut tracker = provenance_tracker.lock().await;
     let proposal = Proposal {
         id: Uuid::new_v4().to_string(),
         risk_class: entry.risk_class,
         authority_source: entry.authority_source,
-        external_content_influence: false,
+        // Gate on Contaminated, not Elevated: Elevated is the normal resting
+        // state for a routine structured response from a Known-graded server,
+        // so gating on it would reject nearly every call shortly after
+        // session start. Contaminated is rare and meaningful.
+        external_content_influence: tracker.current_state == provenance::ProvenanceState::Contaminated,
         mcp_server_id: mcp_server_id.clone(),
         tool_name: tool_name.to_string(),
         bootstrap: entry.bootstrap,
@@ -380,7 +385,6 @@ async fn handle_tools_call(
     };
 
     let mut mem = membrane.lock().await;
-    let mut tracker = provenance_tracker.lock().await;
     let eval_result = mem.evaluate(&proposal, connection_id, &mut tracker, audit_logger);
     drop(mem);
 
