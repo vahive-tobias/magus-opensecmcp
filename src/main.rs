@@ -15,6 +15,7 @@ use magus_opensecmcp::audit::AuditLogger;
 use magus_opensecmcp::downstream::DownstreamConnection;
 use magus_opensecmcp::hasher::{compute_definition_hash, hash_to_hex, McpToolDefinition};
 use magus_opensecmcp::membrane::{Membrane, Proposal};
+use magus_opensecmcp::pin_policy::{self, PinStatus};
 use magus_opensecmcp::provenance::{self, AgentProvenanceTracker, SchemaConformance};
 
 const FREE_TIER_MAX_AGENTS: usize = 3;
@@ -27,6 +28,17 @@ struct DiscoveredServer {
     server_id: String,
     source_grade: SourceGrade,
     tools: Vec<McpToolDefinition>,
+}
+
+/// A confirmed hash-pin mismatch found during discovery, collected across
+/// every server/tool so the `refuse_startup_on_pin_mismatch` decision (and
+/// the summary printed for it) can see the complete picture, not just the
+/// first one found — see spec-sec03-hash-pin-enforcement.md.
+struct PinMismatch {
+    server_id: String,
+    tool_name: String,
+    expected: String,
+    actual: String,
 }
 
 #[tokio::main]
@@ -111,6 +123,16 @@ async fn main() -> Result<()> {
         .context("Failed to load tool registry")?;
     eprintln!("[MAGUS] Loaded config. Downstream servers: {}", registry.servers.len());
 
+    // ---- security_policy sanity check, before any discovery work happens.
+    //      Checked here, not after discovery, specifically so a nonsensical
+    //      config is refused without first spawning every downstream server
+    //      for nothing — see pin_policy::validate_policy.
+    if let Err(msg) = pin_policy::validate_policy(&registry.security_policy) {
+        eprintln!("[MAGUS] FATAL: invalid security_policy configuration.");
+        eprintln!("[MAGUS]   {}", msg);
+        std::process::exit(2);
+    }
+
     // ---- Spawn + initialize every configured downstream server, discover its
     //      real tools, and hash-pin each definition. This is the step the
     //      original draft never did — nothing was ever actually connected to.
@@ -124,6 +146,10 @@ async fn main() -> Result<()> {
     // the state machine (it already did before this change; only the
     // population of the value was missing).
     let mut tool_output_schemas: HashMap<String, serde_json::Value> = HashMap::new();
+    // Confirmed hash-pin mismatches, collected across every server/tool
+    // during discovery. Acted on only after the full loop below completes —
+    // see the refuse-startup / quarantine decision after it.
+    let mut mismatches: Vec<PinMismatch> = Vec::new();
 
     for server_cfg in &registry.servers {
         eprintln!("[MAGUS] Spawning downstream '{}': {} {:?}", server_cfg.server_id, server_cfg.command, server_cfg.args);
@@ -138,21 +164,28 @@ async fn main() -> Result<()> {
             let hash = compute_definition_hash(t);
             let hash_hex = hash_to_hex(&hash);
             let pin = registry.lookup(&server_cfg.server_id, &t.name).pinned_definition_hash_hex;
-            match &pin {
-                Some(pinned) if pinned.eq_ignore_ascii_case(&hash_hex) => {
+            let pin_status = PinStatus::from_pin(pin.as_deref(), &hash_hex);
+            match &pin_status {
+                PinStatus::Matched => {
                     eprintln!("[MAGUS] '{}'/{}: definition hash matches pin.", server_cfg.server_id, t.name);
                 }
-                Some(pinned) => {
+                PinStatus::Mismatched { expected, actual } => {
                     eprintln!(
                         "[MAGUS] WARNING: '{}'/{} definition hash does NOT match the pinned value in config.yaml.\n\
                          [MAGUS]   expected: {}\n\
                          [MAGUS]   actual:   {}\n\
                          [MAGUS]   The tool's description or schema changed since this was pinned. Treat this\n\
                          [MAGUS]   the same as an unreviewed new tool until you've confirmed the change is legitimate.",
-                        server_cfg.server_id, t.name, pinned, hash_hex
+                        server_cfg.server_id, t.name, expected, actual
                     );
+                    mismatches.push(PinMismatch {
+                        server_id: server_cfg.server_id.clone(),
+                        tool_name: t.name.clone(),
+                        expected: expected.clone(),
+                        actual: actual.clone(),
+                    });
                 }
-                None => {
+                PinStatus::NotYetPinned => {
                     eprintln!("[MAGUS] '{}'/{}: no pin set yet. First-seen hash: {}", server_cfg.server_id, t.name, hash_hex);
                 }
             }
@@ -212,6 +245,42 @@ async fn main() -> Result<()> {
         });
     }
 
+    // ---- Decide what to do with the complete pin-mismatch picture, now
+    //      that discovery has finished for every server. Not done per-tool
+    //      or per-server above — refuse_startup_on_pin_mismatch's summary
+    //      needs to list every mismatch found anywhere in one pass, and
+    //      security_policy's own validity was already checked before
+    //      discovery ran at all.
+    if registry.security_policy.refuse_startup_on_pin_mismatch && !mismatches.is_empty() {
+        eprintln!(
+            "[MAGUS] FATAL: refuse_startup_on_pin_mismatch is set and {} tool(s) failed hash-pin verification:",
+            mismatches.len()
+        );
+        for m in &mismatches {
+            eprintln!(
+                "[MAGUS]   '{}'/{}: expected {}, got {}",
+                m.server_id, m.tool_name, m.expected, m.actual
+            );
+        }
+        std::process::exit(3);
+    }
+
+    // Tool name -> human-readable reason. Checked in handle_tools_call
+    // before the tool_owner lookup, so a quarantined tool gets a distinct,
+    // specific rejection instead of looking like it never existed.
+    let mut quarantined_tools: HashMap<String, String> = HashMap::new();
+    if registry.security_policy.strict_schema_pinning {
+        for m in &mismatches {
+            let reason = format!("hash mismatch: expected {}, got {}", m.expected, m.actual);
+            eprintln!("[MAGUS] QUARANTINED '{}'/{}: {}", m.server_id, m.tool_name, reason);
+            tool_owner.remove(&m.tool_name);
+            if let Some(ds) = discovered.iter_mut().find(|d| d.server_id == m.server_id) {
+                ds.tools.retain(|t| t.name != m.tool_name);
+            }
+            quarantined_tools.insert(m.tool_name.clone(), reason);
+        }
+    }
+
     // ---- Core governance components ----
     let session_id = Uuid::new_v4().to_string();
     let audit_logger = Arc::new(AuditLogger::new(&session_id));
@@ -255,7 +324,7 @@ async fn main() -> Result<()> {
             "notifications/initialized" => None, // agent's own handshake notification; nothing to send back
             "tools/list" => Some(handle_tools_list(&id, &discovered)),
             "tools/call" => Some(handle_tools_call(
-                &id, &json_rpc, &registry, &rule_engine, &tool_owner, &tool_output_schemas, &connections,
+                &id, &json_rpc, &registry, &rule_engine, &tool_owner, &quarantined_tools, &tool_output_schemas, &connections,
                 &membrane, &provenance_tracker, &audit_logger, connection_id,
             ).await),
             _ if is_notification => None,
@@ -347,6 +416,7 @@ async fn handle_tools_call(
     registry: &ToolRegistry,
     rule_engine: &RuleEngine,
     tool_owner: &HashMap<String, String>,
+    quarantined_tools: &HashMap<String, String>,
     tool_output_schemas: &HashMap<String, serde_json::Value>,
     connections: &HashMap<String, Arc<Mutex<DownstreamConnection>>>,
     membrane: &Arc<Mutex<Membrane>>,
@@ -360,6 +430,20 @@ async fn handle_tools_call(
     };
     let tool_name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
     let arguments = params.get("arguments").cloned().unwrap_or(serde_json::json!({}));
+
+    // Checked before the tool_owner lookup, deliberately: an agent that
+    // already knows this tool's name (cached from an earlier session, or
+    // from documentation) and calls it directly must get a distinct,
+    // specific rejection, not a generic "Unknown tool" that makes it look
+    // like the tool never existed.
+    if let Some(reason) = quarantined_tools.get(tool_name) {
+        return jsonrpc_error(
+            id,
+            -32602,
+            &format!("Tool quarantined: {}", reason),
+            Some("ToolQuarantinedPinMismatch"),
+        );
+    }
 
     let mcp_server_id = match tool_owner.get(tool_name) {
         Some(s) => s.clone(),

@@ -36,6 +36,19 @@ pub enum SourceGrade {
     Suspicious,
 }
 
+/// Optional, top-level policy for how a discovery-time hash-pin mismatch is
+/// handled. Absent entirely from `config.yaml` (or every field omitted)
+/// deserializes to all-`false`, which is today's warn-only behavior,
+/// unchanged — see `pin_policy.rs` and
+/// `docs/specs/spec-sec03-hash-pin-enforcement.md`.
+#[derive(Debug, Clone, Copy, Deserialize, Default)]
+pub struct SecurityPolicy {
+    #[serde(default)]
+    pub strict_schema_pinning: bool,
+    #[serde(default)]
+    pub refuse_startup_on_pin_mismatch: bool,
+}
+
 /// The configuration for a downstream MCP server connection.
 #[derive(Debug, Clone, Deserialize)]
 pub struct DownstreamServerConfig {
@@ -71,6 +84,8 @@ struct YamlConfig {
     downstream_servers: Vec<DownstreamServerConfig>,
     #[serde(default)]
     tools: Vec<YamlToolEntry>,
+    #[serde(default)]
+    security_policy: SecurityPolicy,
 }
 
 /// The runtime representation of a tool in the registry.
@@ -92,6 +107,7 @@ pub struct ToolRegistryEntry {
 pub struct ToolRegistry {
     entries: HashMap<(String, String), ToolRegistryEntry>,
     pub servers: Vec<DownstreamServerConfig>,
+    pub security_policy: SecurityPolicy,
 }
 
 impl ToolRegistry {
@@ -119,6 +135,7 @@ impl ToolRegistry {
         Ok(Self {
             entries,
             servers: config.downstream_servers,
+            security_policy: config.security_policy,
         })
     }
 

@@ -11,6 +11,7 @@ pub mod audit;
 pub mod downstream;
 pub mod hasher;
 pub mod membrane;
+pub mod pin_policy;
 pub mod provenance;
 pub mod quota;
 pub mod registry;
