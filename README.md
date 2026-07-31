@@ -107,8 +107,15 @@ echo "hello" > /tmp/magus-demo/notes.txt
 ```
 
 Point your MCP client at this binary instead of the real filesystem server
-directly, and watch `~/.magus/audit.jsonl` for the decision log. Or drive it
-by hand to see it work without wiring up a client yet:
+directly, and watch `~/.magus/audit.jsonl` for the decision log.
+
+This is the entire security model, stated plainly: if your client is
+*also* configured to reach the real downstream server directly — not
+just through this gateway — nothing here can detect or prevent
+whatever happens through that other path. The gateway only sees
+traffic that's actually routed through it.
+
+Or drive it by hand to see it work without wiring up a client yet:
 
 ```bash
 printf '%s\n' \
@@ -259,6 +266,14 @@ tool DOES declare one, the gateway now checks the response against it:
   they declare the schema; treating every such gap as a violation would
   make this noisy against legitimate, slightly-behind-spec tools rather
   than precise against malicious ones.
+
+Worth setting expectations here: even among servers that support the
+newer MCP spec revisions, declaring `outputSchema` at all is still
+uncommon in practice as of this writing — so `Conformant`/`Violated`
+firing rarely, or not at all, in your own audit log doesn't mean the
+mechanism is broken. The enforcement path is real and already tested;
+it's waiting on more of the ecosystem to declare contracts, not on
+anything missing here.
 
 `schema_check.rs` is a deliberately narrow structural checker (`type`,
 `properties`, `required`, `items`, `enum`, `additionalProperties: false`) —

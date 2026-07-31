@@ -52,7 +52,12 @@ Every tool definition is canonically hashed (`hasher.rs`, recursive
 blake3, length-prefixed and type-tagged to prevent concatenation
 collisions) at discovery time. A pinned hash in `config.yaml` that
 mismatches what the server actually returns is surfaced immediately — see
-`main.rs`'s discovery loop.
+`main.rs`'s discovery loop. This defends against exactly the class of attack
+behind `CVE-2025-54136` ("MCPoison") and its sibling `CVE-2025-54135`
+("CurXecute"), both disclosed against Cursor in August 2025: a client
+approved a tool identifier once, then the payload changed while the
+approved name stayed the same. Hash-pinning the full definition — not
+just the name — is what closes that specific, disclosed gap.
 
 **Indirect prompt injection via tool output.** Tool *responses* — not the
 agent's own conversation — are scanned against `locked-rules.yaml`
