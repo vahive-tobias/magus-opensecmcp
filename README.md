@@ -191,6 +191,17 @@ happen as a side effect of an unrelated dependency bump.
 the calling agent has no field in the MCP wire protocol to claim its own risk
 level, so this can't be self-attested even by accident.
 
+Each tool entry also accepts an optional `communicates_externally: true` —
+operator-declared only, never auto-detected, defaulting to `false` so an
+existing `config.yaml` written before this field existed parses and behaves
+identically. It's for tools that reach outside the local machine (a
+`fetch_url`, an HTTP client, anything hitting a network endpoint): once a
+session shows evidence of compromise, a tagged tool's `risk_class` is bumped
+up one tier (`Low→Medium→High→Critical`, saturating) on top of whatever the
+provenance state table already applied — raising the cost of exfiltrating
+through that specific tool, not blocking it outright. See `THREAT_MODEL.md`
+for what this does and doesn't guarantee.
+
 ## Detection rules: `locked-rules.yaml` + `user-rules.yaml`
 
 Detection used to be four hardcoded literal strings compiled into

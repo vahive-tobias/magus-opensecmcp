@@ -19,6 +19,13 @@ pub struct Proposal {
     pub risk_class: RiskClass,
     pub authority_source: AuthoritySource,
     pub external_content_influence: bool,
+    /// OP-3 capability tag: does this tool communicate outside the local
+    /// machine? Operator-declared in `config.yaml`, resolved in main.rs from
+    /// `entry.communicates_externally` at the existing construction site.
+    /// Applied as a one-tier risk bump in `modulate_risk_class`, AFTER the
+    /// provenance state table — see that function's doc comment for why the
+    /// ordering is load-bearing.
+    pub communicates_externally: bool,
     /// The downstream server's static trust grade, resolved once at
     /// proposal-construction time (main.rs already looks this up for
     /// `compute_new_state`; this reuses that same value rather than a new
@@ -78,18 +85,36 @@ impl RejectionCode {
     }
 }
 
-/// Modulates a proposal's risk class based on the current tracker state, and
-/// enforces the Critical gate: any Critical action requires Clean provenance,
-/// full stop, independent of BP budget. This is what keeps the worst-tier
-/// action safe even if DECAY_MULTIPLIER's calibration turns out to be wrong.
+/// Modulates a proposal's risk class based on the current tracker state and
+/// the OP-3 capability tag, and enforces the Critical gate: any Critical
+/// action requires Clean provenance, full stop, independent of BP budget.
+/// This is what keeps the worst-tier action safe even if DECAY_MULTIPLIER's
+/// calibration turns out to be wrong.
 ///
 /// Relocated here from provenance.rs (pure move, no behavior change) — it
 /// takes a `RiskClass` and returns an operational rejection, which is a
 /// decision, not an observation about the information environment; see
 /// docs/specs/spec-provenance-semantics-correction.md §6.
+///
+/// **Ordering is load-bearing: the state table runs FIRST, the
+/// `communicates_externally` tag bump SECOND, the Critical gate LAST.** Do
+/// not reorder this. The two orderings are not equivalent — they diverge on
+/// (Medium, Elevated) and (Low, Contaminated). Tag-first would hard-block
+/// every tagged Medium-risk tool the instant a session reaches Elevated,
+/// which is the normal resting state for any session that has read
+/// anything, not an edge case — the same "security feature gets switched
+/// off under deadline pressure" failure this project already avoided twice
+/// (the Elevated-vs-Contaminated gating decision in SEC-06, and the
+/// corroboration threshold in the provenance semantics correction).
+/// Tag-after instead modifies an already-state-adjusted risk: the state
+/// table answers how degraded the session's information environment is;
+/// the tag answers how consequential this particular action is. See
+/// docs/specs/spec-op3-capability-tag.md for the full 16-cell table and
+/// worked reasoning.
 pub fn modulate_risk_class(
     proposal_risk: &mut RiskClass,
     state: &ProvenanceState,
+    communicates_externally: bool,
 ) -> Result<(), &'static str> {
     match (*proposal_risk, *state) {
         (_, ProvenanceState::Clean) => {}
@@ -98,6 +123,14 @@ pub fn modulate_risk_class(
         (RiskClass::High, ProvenanceState::Contaminated) => *proposal_risk = RiskClass::Critical,
         (_, ProvenanceState::Poisoned) => return Err("InboundPoisoningDetected"),
         _ => {}
+    }
+
+    if communicates_externally {
+        *proposal_risk = match *proposal_risk {
+            RiskClass::Low => RiskClass::Medium,
+            RiskClass::Medium => RiskClass::High,
+            RiskClass::High | RiskClass::Critical => RiskClass::Critical, // saturates
+        };
     }
 
     if *proposal_risk == RiskClass::Critical && *state != ProvenanceState::Clean {
@@ -161,7 +194,7 @@ impl Membrane {
         }
 
         let mut effective_risk = proposal.risk_class;
-        if let Err(e) = modulate_risk_class(&mut effective_risk, &tracker.current_state) {
+        if let Err(e) = modulate_risk_class(&mut effective_risk, &tracker.current_state, proposal.communicates_externally) {
             let code = match e {
                 "InboundPoisoningDetected" => RejectionCode::InboundPoisoningDetected,
                 "CriticalBlockedByProvenance" => RejectionCode::CriticalBlockedByProvenance,
@@ -237,6 +270,7 @@ impl Membrane {
             risk_class: proposal.risk_class,
             authority_source: proposal.authority_source,
             bootstrap: proposal.bootstrap,
+            communicates_externally: proposal.communicates_externally,
             status: "Approved".to_string(),
             rejection_code: None,
             provenance_state: tracker.current_state,
@@ -269,6 +303,7 @@ impl Membrane {
             risk_class: proposal.risk_class,
             authority_source: proposal.authority_source,
             bootstrap: proposal.bootstrap,
+            communicates_externally: proposal.communicates_externally,
             status: "Rejected".to_string(),
             rejection_code: Some(code.as_str().to_string()),
             provenance_state: tracker.current_state,
@@ -297,8 +332,10 @@ mod tests {
 
     /// source_grade defaults to Known — a graded server, so it never
     /// triggers the Unvalidated surcharge by accident in tests that aren't
-    /// specifically about it. Tests that need Unvalidated set
-    /// `.source_grade` directly on the returned Proposal.
+    /// specifically about it. communicates_externally defaults to false for
+    /// the same reason (untagged, so OP-3's bump never leaks into a test
+    /// that isn't about it). Tests that need either set the field directly
+    /// on the returned Proposal.
     fn make_proposal(
         id: &str,
         risk_class: RiskClass,
@@ -310,6 +347,7 @@ mod tests {
             risk_class,
             authority_source,
             external_content_influence,
+            communicates_externally: false,
             source_grade: SourceGrade::Known,
             mcp_server_id: "server-a".to_string(),
             tool_name: "tool-a".to_string(),
@@ -639,7 +677,7 @@ mod tests {
     fn clean_state_never_changes_risk_class_for_any_variant() {
         for risk in [RiskClass::Low, RiskClass::Medium, RiskClass::High, RiskClass::Critical] {
             let mut r = risk;
-            let result = modulate_risk_class(&mut r, &ProvenanceState::Clean);
+            let result = modulate_risk_class(&mut r, &ProvenanceState::Clean, false);
             assert!(result.is_ok(), "Clean must never block, got {:?} for risk {:?}", result, risk);
             assert_eq!(r, risk, "Clean must never change the risk class, got {:?} for original {:?}", r, risk);
         }
@@ -652,7 +690,7 @@ mod tests {
         // shape as (High, Contaminated) below. The risk class still ends
         // up Critical; the call still errors.
         let mut r = RiskClass::High;
-        let result = modulate_risk_class(&mut r, &ProvenanceState::Elevated);
+        let result = modulate_risk_class(&mut r, &ProvenanceState::Elevated, false);
         assert_eq!(result, Err("CriticalBlockedByProvenance"), "bumping to Critical under a non-Clean state must then trip the Critical gate");
         assert_eq!(r, RiskClass::Critical);
     }
@@ -660,7 +698,7 @@ mod tests {
     #[test]
     fn medium_contaminated_bumps_to_high() {
         let mut r = RiskClass::Medium;
-        let result = modulate_risk_class(&mut r, &ProvenanceState::Contaminated);
+        let result = modulate_risk_class(&mut r, &ProvenanceState::Contaminated, false);
         assert!(result.is_ok(), "bumping Medium->High under Contaminated must not itself be blocked");
         assert_eq!(r, RiskClass::High);
     }
@@ -668,7 +706,7 @@ mod tests {
     #[test]
     fn high_contaminated_bumps_to_critical() {
         let mut r = RiskClass::High;
-        let result = modulate_risk_class(&mut r, &ProvenanceState::Contaminated);
+        let result = modulate_risk_class(&mut r, &ProvenanceState::Contaminated, false);
         assert_eq!(result, Err("CriticalBlockedByProvenance"), "bumping to Critical under a non-Clean state must then trip the Critical gate");
         assert_eq!(r, RiskClass::Critical, "the bump to Critical must still have applied even though the call then errors");
     }
@@ -677,7 +715,7 @@ mod tests {
     fn low_is_exempt_from_the_bump_table_under_elevated_and_contaminated() {
         for state in [ProvenanceState::Elevated, ProvenanceState::Contaminated] {
             let mut r = RiskClass::Low;
-            let result = modulate_risk_class(&mut r, &state);
+            let result = modulate_risk_class(&mut r, &state, false);
             assert!(result.is_ok(), "Low must not be blocked under {:?}", state);
             assert_eq!(r, RiskClass::Low, "Low must not be bumped by a catch-all arm under {:?}", state);
         }
@@ -687,7 +725,7 @@ mod tests {
     fn poisoned_blocks_every_risk_class_including_low() {
         for risk in [RiskClass::Low, RiskClass::Medium, RiskClass::High, RiskClass::Critical] {
             let mut r = risk;
-            let result = modulate_risk_class(&mut r, &ProvenanceState::Poisoned);
+            let result = modulate_risk_class(&mut r, &ProvenanceState::Poisoned, false);
             assert_eq!(result, Err("InboundPoisoningDetected"), "Poisoned must block risk class {:?} too, not just High/Critical", risk);
         }
     }
@@ -697,13 +735,13 @@ mod tests {
         // (Medium, Contaminated) bumps to High, NOT Critical — must NOT
         // trip the Critical-block path.
         let mut medium = RiskClass::Medium;
-        assert!(modulate_risk_class(&mut medium, &ProvenanceState::Contaminated).is_ok());
+        assert!(modulate_risk_class(&mut medium, &ProvenanceState::Contaminated, false).is_ok());
         assert_eq!(medium, RiskClass::High);
 
         // (High, Contaminated) bumps to Critical — MUST then trip it.
         let mut high = RiskClass::High;
         assert_eq!(
-            modulate_risk_class(&mut high, &ProvenanceState::Contaminated),
+            modulate_risk_class(&mut high, &ProvenanceState::Contaminated, false),
             Err("CriticalBlockedByProvenance")
         );
         assert_eq!(high, RiskClass::Critical);
@@ -713,8 +751,156 @@ mod tests {
     fn originally_critical_risk_class_with_non_clean_state_is_blocked() {
         for state in [ProvenanceState::Elevated, ProvenanceState::Contaminated] {
             let mut r = RiskClass::Critical;
-            let result = modulate_risk_class(&mut r, &state);
+            let result = modulate_risk_class(&mut r, &state, false);
             assert_eq!(result, Err("CriticalBlockedByProvenance"), "an originally-Critical risk class under {:?} must be blocked", state);
         }
+    }
+
+    // ---- OP-3: communicates_externally capability tag ----
+    // See docs/specs/spec-op3-capability-tag.md. The bump applies AFTER the
+    // state table (checked below), not before — the ordering is load-bearing.
+
+    #[test]
+    fn tagged_bump_raises_risk_class_by_exactly_one_tier_at_clean() {
+        // At Clean the state table is a no-op, so this isolates the tag
+        // bump itself, tier by tier.
+        let mut low = RiskClass::Low;
+        assert!(modulate_risk_class(&mut low, &ProvenanceState::Clean, true).is_ok());
+        assert_eq!(low, RiskClass::Medium);
+
+        let mut medium = RiskClass::Medium;
+        assert!(modulate_risk_class(&mut medium, &ProvenanceState::Clean, true).is_ok());
+        assert_eq!(medium, RiskClass::High);
+
+        let mut high = RiskClass::High;
+        assert!(modulate_risk_class(&mut high, &ProvenanceState::Clean, true).is_ok());
+        assert_eq!(high, RiskClass::Critical);
+    }
+
+    #[test]
+    fn tagged_bump_saturates_at_critical_rather_than_overflowing() {
+        let mut r = RiskClass::Critical;
+        // Critical + Clean: state table is a no-op, tag bump must not wrap
+        // or panic — it stays Critical, and Clean means it's still approved.
+        let result = modulate_risk_class(&mut r, &ProvenanceState::Clean, true);
+        assert!(result.is_ok());
+        assert_eq!(r, RiskClass::Critical);
+    }
+
+    /// THE regression guard for this change. A tagged Medium tool at
+    /// Elevated must be ALLOWED, bumped to High — not blocked. If the tag
+    /// bump is ever applied BEFORE the state table instead of after, this
+    /// exact case inverts: (Medium -> tag -> High) then the state table's
+    /// (High, Elevated) arm fires and bumps again to Critical, which then
+    /// trips the Critical gate and hard-blocks a call that should have been
+    /// a graduated, non-blocking cost increase. Elevated is the normal
+    /// resting state for any session that has read anything — this is not
+    /// an edge case, it is the common path every tagged Medium-risk tool
+    /// takes shortly after session start. Named so its failure message
+    /// alone identifies an inverted ordering, the way
+    /// single_heuristic_hit_from_elevated_produces_contaminated_not_poisoned
+    /// does for the provenance semantics correction.
+    #[test]
+    fn tagged_medium_at_elevated_is_allowed_as_high_tag_must_apply_after_state_table_not_before() {
+        let mut r = RiskClass::Medium;
+        let result = modulate_risk_class(&mut r, &ProvenanceState::Elevated, true);
+        assert!(
+            result.is_ok(),
+            "a tagged Medium tool at Elevated must be ALLOWED as High, not blocked — \
+             got {:?}. If this fails, the tag bump is being applied BEFORE the state \
+             table instead of after, which hard-blocks every tagged Medium-risk tool \
+             the instant a session reaches Elevated (the normal resting state for any \
+             session that has read anything, not an edge case).",
+            result
+        );
+        assert_eq!(r, RiskClass::High, "correct ordering bumps Medium -> High, not Medium -> High -> Critical");
+    }
+
+    /// The accepted cost of the correct ordering (§ of the spec's 16-cell
+    /// table): a tagged Low tool under Contaminated reaches Medium, not
+    /// High. Recovered by the BP layer (Contaminated's 135% surcharge on
+    /// top of the tag-bumped Medium base rate), not by a bigger risk bump.
+    #[test]
+    fn tagged_low_at_contaminated_reaches_medium_not_high() {
+        let mut r = RiskClass::Low;
+        let result = modulate_risk_class(&mut r, &ProvenanceState::Contaminated, true);
+        assert!(result.is_ok());
+        assert_eq!(r, RiskClass::Medium);
+    }
+
+    /// Confirms the tag reuses the EXISTING Critical gate rather than a new
+    /// parallel one: a tagged High tool at Elevated hits the state table's
+    /// (High, Elevated) -> Critical arm first, the tag bump is then a no-op
+    /// (already Critical, saturates), and the existing gate fires exactly
+    /// as it would for any other Critical proposal under non-Clean state.
+    #[test]
+    fn tagged_high_at_elevated_is_blocked_by_the_existing_critical_gate() {
+        let mut r = RiskClass::High;
+        let result = modulate_risk_class(&mut r, &ProvenanceState::Elevated, true);
+        assert_eq!(result, Err("CriticalBlockedByProvenance"));
+        assert_eq!(r, RiskClass::Critical);
+    }
+
+    /// The tag doesn't change what a poisoned session does — Poisoned's
+    /// early return in the state table fires before the tag bump is ever
+    /// reached, for every risk class, tagged or not.
+    #[test]
+    fn tagged_tool_at_poisoned_still_gets_inbound_poisoning_detected() {
+        for risk in [RiskClass::Low, RiskClass::Medium, RiskClass::High, RiskClass::Critical] {
+            let mut r = risk;
+            let result = modulate_risk_class(&mut r, &ProvenanceState::Poisoned, true);
+            assert_eq!(result, Err("InboundPoisoningDetected"), "tagged risk {:?} at Poisoned must still be InboundPoisoningDetected", risk);
+        }
+    }
+
+    /// End-to-end through Membrane::evaluate, not just modulate_risk_class
+    /// directly: a tagged Low proposal at Clean state consumes the Medium
+    /// base rate (800 BP), not the Low rate (200 BP) — because
+    /// effective_risk is already tag-bumped by the time base_bp is looked
+    /// up, no separate BP-tier lookup for the tag is needed.
+    #[test]
+    fn tagged_low_proposal_consumes_medium_base_rate() {
+        let mut membrane = make_membrane(3, 5000);
+        let connection_id = Uuid::new_v4();
+        membrane.register_agent(connection_id).unwrap();
+        let mut tracker = AgentProvenanceTracker::new();
+        let audit = AuditLogger::new_with_path(temp_audit_path(), "test-session");
+
+        let mut proposal = make_proposal("prop-1", RiskClass::Low, AuthoritySource::User, false);
+        proposal.communicates_externally = true;
+        let result = membrane.evaluate(&proposal, connection_id, &mut tracker, &audit);
+        assert!(result.is_ok());
+
+        let expected_bp = SESSION_INIT_BP + 800; // Medium base rate, not Low's 200
+        assert_eq!(
+            *membrane.agent_accumulators.get(&connection_id).unwrap(),
+            expected_bp,
+            "a tagged Low proposal must be charged the Medium base rate"
+        );
+    }
+
+    /// The tag stacks with the existing surcharges: tagged Low (-> Medium
+    /// base 800) with external_content_influence (135%) and an Unvalidated
+    /// source (150%), all multiplicative.
+    #[test]
+    fn tagged_proposal_stacks_with_existing_surcharges() {
+        let mut membrane = make_membrane(3, 5000);
+        let connection_id = Uuid::new_v4();
+        membrane.register_agent(connection_id).unwrap();
+        let mut tracker = AgentProvenanceTracker::new();
+        let audit = AuditLogger::new_with_path(temp_audit_path(), "test-session");
+
+        let mut proposal = make_proposal("prop-1", RiskClass::Low, AuthoritySource::System, true);
+        proposal.communicates_externally = true;
+        proposal.source_grade = SourceGrade::Unvalidated;
+        let result = membrane.evaluate(&proposal, connection_id, &mut tracker, &audit);
+        assert!(result.is_ok());
+
+        let expected_bp = SESSION_INIT_BP + (((800 * 135) / 100) * 150) / 100;
+        assert_eq!(
+            *membrane.agent_accumulators.get(&connection_id).unwrap(),
+            expected_bp,
+            "the tag-bumped base rate must still stack multiplicatively with both existing surcharges"
+        );
     }
 }

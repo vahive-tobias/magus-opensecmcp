@@ -29,6 +29,13 @@ pub struct AuditRecord {
     pub risk_class: RiskClass,
     pub authority_source: AuthoritySource,
     pub bootstrap: bool,
+    /// OP-3: whether this tool is operator-tagged as communicating outside
+    /// the local machine. Without this, a tagged `High` tool blocked at
+    /// `Elevated` (now `Critical` after the tag bump) is indistinguishable
+    /// in the log from an untagged `Critical` tool — an operator reading
+    /// `audit.jsonl` needs to see that the tag contributed to the outcome.
+    #[serde(default)]
+    pub communicates_externally: bool,
     pub status: String,
     pub rejection_code: Option<String>,
     pub provenance_state: ProvenanceState,

@@ -102,6 +102,24 @@ structured object and returns something else entirely is anomalous
 regardless of whether any signature fires — this catches shapes nobody
 wrote a specific rule for.
 
+**Raised cost for exfiltration through a network-capable tool, once a
+session shows evidence of compromise.** `risk_class` answers "how bad if
+this goes wrong," not "is this the kind of action an injection specifically
+wants" — a `Low`-risk `fetch_url` is precisely the shape an exfiltration
+attempt reaches for. A tool the operator has marked
+`communicates_externally: true` in `config.yaml` gets its `risk_class`
+bumped up one tier, on top of whatever the provenance state table already
+applied, the moment the session reaches `Contaminated` or worse — see
+`membrane::modulate_risk_class`, and the ordering discussion there
+specifically (the bump applies *after* the state table, not before, which
+matters). Framed honestly: this raises the cost of exfiltrating through a
+network-capable tool once the session is already flagged; it does not
+prevent exfiltration, and it depends entirely on the operator having tagged
+the tool correctly — the same operator-supplied classification caveat
+already stated below for `risk_class` itself. Only one tag exists
+(`communicates_externally`) — deliberately, not a capability taxonomy; see
+that field's own documentation in README for why.
+
 **Config that tries to weaken itself.** `user-rules.yaml`'s action grammar
 has no `allow`/`bypass` value — a rule that tries to weaken enforcement
 fails to parse rather than needing to be specially detected and rejected.

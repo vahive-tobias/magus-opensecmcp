@@ -472,6 +472,7 @@ async fn handle_tools_call(
         // shortly after session start. See
         // docs/specs/spec-provenance-semantics-correction.md.
         external_content_influence: tracker.current_state == provenance::ProvenanceState::Contaminated,
+        communicates_externally: entry.communicates_externally,
         source_grade: server_grade,
         mcp_server_id: mcp_server_id.clone(),
         tool_name: tool_name.to_string(),

@@ -76,6 +76,15 @@ struct YamlToolEntry {
     /// warn-only, not a hard block — see main.rs's discovery loop).
     #[serde(default)]
     pinned_definition_hash_hex: Option<String>,
+    /// OP-3 capability tag: does this tool communicate outside the local
+    /// machine (network fetch, external API call, etc.)? Operator-declared
+    /// only — never auto-detected. Defaults to `false`, so an existing
+    /// `config.yaml` written before this field existed parses and behaves
+    /// identically. See `membrane::modulate_risk_class` for what this
+    /// actually does — a one-tier risk bump applied AFTER the provenance
+    /// state table, not a new gate.
+    #[serde(default)]
+    communicates_externally: bool,
 }
 
 /// The root YAML file structure.
@@ -101,6 +110,7 @@ pub struct ToolRegistryEntry {
     /// silently at Low, never silently at Critical).
     pub bootstrap: bool,
     pub pinned_definition_hash_hex: Option<String>,
+    pub communicates_externally: bool,
 }
 
 /// The in-memory tool registry.
@@ -129,6 +139,7 @@ impl ToolRegistry {
                 authority_source: tool.authority_source,
                 bootstrap: false,
                 pinned_definition_hash_hex: tool.pinned_definition_hash_hex,
+                communicates_externally: tool.communicates_externally,
             });
         }
 
@@ -154,6 +165,12 @@ impl ToolRegistry {
                 authority_source: AuthoritySource::User,
                 bootstrap: true,
                 pinned_definition_hash_hex: None,
+                // Deliberately false, not guessed: bootstrap already applies
+                // a Medium risk ceiling for an unclassified tool. Inventing
+                // a capability claim here would be guessing at a
+                // security-relevant property rather than defaulting
+                // conservatively on a known one.
+                communicates_externally: false,
             })
     }
 
