@@ -176,3 +176,47 @@ fn secret_aws_001_escalates_on_structurally_real_high_entropy_key() {
         hits.rule_ids().join(", ")
     );
 }
+
+/// Post-fix proof, superseding the pre-fix gap-demonstration test that
+/// lived at this location (see docs/specs/spec-secret-gh-001.md's fix
+/// report for that test's "before" output — it asserted the real-shaped
+/// token and a documentation-style placeholder received identical
+/// flag-only treatment, and passed, because SECRET-GH-001 then had
+/// neither `escalate_if` nor `exempt_if_contains`). Now that the fix has
+/// landed, this fixture's role per step 3 of the spec is the
+/// should_still_catch-equivalent proof: a genuinely real-shaped,
+/// high-entropy GitHub-token-shaped string must still escalate. The
+/// should_be_silent-equivalent proof (the documented placeholder,
+/// producing zero hits) lives as a committed fixture instead:
+/// `tests/fixtures/should_be_silent/gh_doc_placeholder_readme.md`.
+///
+/// Built in-line from two non-contiguous literals joined at runtime,
+/// mirroring `secret_aws_001_escalates_on_structurally_real_high_entropy_key`
+/// above: no single committed span of source text here contains a
+/// contiguous run matching `gh[pousr]_[A-Za-z0-9]{36,}`, only the
+/// reconstructed runtime string does, so this doesn't trip GitHub's own
+/// secret-scanning push protection on push.
+#[test]
+fn secret_gh_001_escalates_on_structurally_real_high_entropy_token() {
+    let engine = RuleEngine::load(None).expect("locked-rules.yaml must load standalone");
+
+    let prefix = "ghp_";
+    let mid = "jrmMLgn7VLNVcQIHMmya";
+    let tail = "56zedt0w17FRX1Es3Oco";
+    let token = format!("{prefix}{mid}{tail}");
+    let content = format!(
+        "$ cat deploy/.env.production\nGITHUB_TOKEN={token}\nDB_HOST=prod-db-primary.internal\n"
+    );
+
+    let normalized = normalize_for_matching(&content);
+    let hits = engine.scan(&normalized, Scope::ToolOutputOnly, "fp-corpus-test");
+    let state = state_from_rule_hits(&hits, ProvenanceState::Clean);
+    assert!(
+        state >= ProvenanceState::Elevated,
+        "a structurally-real, high-entropy GitHub-token-shaped string was expected \
+         to escalate via SECRET-GH-001's escalate_if, but stayed at {:?} \
+         (rule hit(s): [{}])",
+        state,
+        hits.rule_ids().join(", ")
+    );
+}

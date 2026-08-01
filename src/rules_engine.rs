@@ -848,6 +848,66 @@ mod tests {
         );
     }
 
+    /// Applies the exempt_if_contains + escalate_if pattern (already proven
+    /// generic by the two tests above) to SECRET-GH-001's *actual*
+    /// locked-rules.yaml configuration, not a synthetic copy — loads the
+    /// real locked rules deliberately, per
+    /// docs/specs/spec-secret-gh-001.md's instruction not to assume
+    /// SECRET-AWS-001's pattern, threshold, or exemption shape transfer to
+    /// GH-001's wider (62-char) alphabet without re-verifying against real
+    /// measurements.
+    ///
+    /// Entropy values measured ahead of time with the real `shannon_entropy`
+    /// function, over ten random 36-62-char samples plus the researched
+    /// placeholder (full record in this fix's report / commit history):
+    /// genuinely random tokens measured ~4.61-5.11 bits/char; GitHub's own
+    /// REST API docs placeholder (docs.github.com/en/rest/credentials/revoke,
+    /// "Revoke a personal access token") measured ~4.23 bits/char — close
+    /// enough to real that, exactly like SECRET-AWS-001's own placeholder,
+    /// entropy_gt: 4.4 alone would not be a trustworthy margin for it;
+    /// exempt_if_contains on its distinctive repeated substring is the
+    /// load-bearing check for that specific documented case, same
+    /// division of labor as SECRET-AWS-001's "EXAMPLE" substring.
+    #[test]
+    fn secret_gh_001_exempts_documented_placeholder_and_escalates_real_shaped_token() {
+        let engine = RuleEngine::load(None).expect("locked-rules.yaml must load standalone");
+
+        // GitHub's own documented placeholder — must be dropped entirely.
+        let placeholder = "ghp_1234567890abcdef1234567890abcdef12345678";
+        let exempted = engine.scan(&format!("token: {placeholder} end"), Scope::ToolOutputOnly, "srv");
+        assert!(
+            exempted.is_empty(),
+            "GitHub's own documented placeholder token must be exempted entirely, got: {:?}",
+            exempted.rule_ids()
+        );
+
+        // A genuinely real-shaped, high-entropy token (measured ~4.803
+        // bits/char ahead of time) — not the documented placeholder
+        // substring — must escalate.
+        let real = "ghp_zBxs7hHGEUb5Gn1GBqgrqRbuO10lKt2F0OSD";
+        let escalated = engine.scan(&format!("token: {real} end"), Scope::ToolOutputOnly, "srv");
+        assert_eq!(escalated.hits.len(), 1, "expected exactly one SECRET-GH-001 hit on the real-shaped token");
+        assert_eq!(
+            escalated.hits[0].action,
+            Action::Elevate,
+            "a real-shaped, high-entropy GitHub-token-shaped match must escalate via entropy_gt"
+        );
+
+        // A low-effort placeholder that is NOT the specific exempted
+        // substring (a plain digit-cycle, measured ~3.641 bits/char) must
+        // stay at the rule's base action — proving exempt_if_contains isn't
+        // doing this work by accident, and that entropy_gt: 4.4 is a real
+        // floor, not a no-op.
+        let digit_cycle = "ghp_0123456789012345678901234567890123456789";
+        let not_escalated = engine.scan(&format!("token: {digit_cycle} end"), Scope::ToolOutputOnly, "srv");
+        assert_eq!(not_escalated.hits.len(), 1, "expected exactly one SECRET-GH-001 hit on the digit-cycle placeholder");
+        assert_eq!(
+            not_escalated.hits[0].action,
+            Action::Flag,
+            "a low-entropy, non-exempted placeholder must stay at the rule's base action, not escalate"
+        );
+    }
+
     #[test]
     fn valid_user_rules_file_is_reflected_in_counts() {
         let dir = std::env::temp_dir().join(format!("magus-test-{}", uuid::Uuid::new_v4()));
