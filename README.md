@@ -60,10 +60,39 @@ package, not simulated:
   repo — now have direct unit test coverage (45 tests) instead of only
   ever having been checked by hand. Covers the full source-grade/
   response-shape classification table, the rule-hit corroboration logic
-  (a second ambiguous signal while already elevated escalates further —
-  a single one doesn't), the invariant that a `Poisoned` session never
+  (a second heuristic signal while already `Contaminated` escalates to
+  `Poisoned` — a single one doesn't), the invariant that a `Poisoned` session never
   auto-recovers regardless of how much subsequent activity occurs, and
   the full replay/quota/authority/risk-budget rejection matrix.
+- Each provenance state now carries exactly one meaning, and the split
+  between the middle two is deliberate: `Elevated` means external content
+  was consumed with nothing detected — the routine case for a vetted
+  server, not itself a signal. `Contaminated` means a heuristic rule hit
+  fired and hasn't been corroborated yet. `Poisoned` means either a
+  corroborated second hit or a deterministic contract breach (a malformed
+  response, or a declared `outputSchema` that was violated) — the latter
+  has no false-positive class, so it never needs corroboration. See
+  `THREAT_MODEL.md` for the full reasoning.
+- A confirmed hash-pin mismatch can now actually be enforced, not just
+  logged. `security_policy.strict_schema_pinning: true` quarantines the
+  specific mismatched tool — absent from `tools/list`, a distinct
+  rejection if called by name anyway — without taking the rest of the
+  gateway down. A stronger `refuse_startup_on_pin_mismatch: true` opt-in
+  refuses the whole gateway to start, with a distinct exit code for
+  script/CI detection. Both default off; an existing `config.yaml` is
+  completely unaffected.
+- When a response causes a genuine state escalation, the gateway now
+  appends a plainly-labeled advisory into the response itself instead of
+  silently changing state while forwarding the original content
+  untouched. The wire format was settled by testing against a real MCP
+  client, not by assumption — the first approach tried (a new field on
+  the response envelope) actually broke the connection outright on a
+  real client; see `THREAT_MODEL.md` for what was tested and why.
+- Tools can be tagged `communicates_externally: true` to raise the cost
+  of using them once a session shows evidence of compromise — see "How
+  it works" below. The ordering question that determines whether this is
+  a proportionate control or one that blocks routine operation was
+  checked directly against the compiled binary, not just the test suite.
 - `magus-gateway --version` and `magus-gateway --help` are real, tested
   flags (`tests/cli_flags.rs`, spawning the actual compiled binary, not
   calling internal functions) — added specifically because Homebrew's
@@ -186,6 +215,8 @@ happen as a side effect of an unrelated dependency bump.
                                           |                     rule id(s) caused a state escalation
                                           |-- quota.rs         : local, in-memory, calendar-reset counter
 ```
+
+Each state in that chain carries exactly one meaning as of this writing — see `THREAT_MODEL.md` for what `Clean`/`Elevated`/`Contaminated`/`Poisoned` actually mean and why the split between the middle two is deliberate.
 
 `risk_class` and `authority_source` come from `config.yaml`'s `tools:` list —
 the calling agent has no field in the MCP wire protocol to claim its own risk
