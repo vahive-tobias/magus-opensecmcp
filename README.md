@@ -318,8 +318,8 @@ it's waiting on more of the ecosystem to declare contracts, not on
 anything missing here.
 
 `schema_check.rs` is a deliberately narrow structural checker (`type`,
-`properties`, `required`, `items`, `enum`, `additionalProperties: false`) —
-not a general-purpose JSON Schema validator. A real one (the `jsonschema`
+`properties`, `required`, `items`, `enum`, `additionalProperties: false`,
+`pattern`) — not a general-purpose JSON Schema validator. A real one (the `jsonschema`
 crate) pulls in URL/IDNA parsing for `$ref` resolution against remote URIs
 and hits the same `edition2024` wall documented above, for machinery this
 project's actual schemas — self-contained structural descriptions, not

@@ -22,16 +22,56 @@
 //   - `items` (recurses into each array element against one shared schema)
 //   - `enum` (literal value membership)
 //   - `additionalProperties: false` (rejects object keys not in `properties`)
+//   - `pattern` (string values only — see below for dialect and bounds)
 //
 // What this explicitly does NOT check — a violation here does not mean
 // full JSON Schema conformance, only that nothing in the above list failed:
-//   `$ref`, `oneOf`/`anyOf`/`allOf`/`not`, `format`, `pattern`,
+//   `$ref`, `oneOf`/`anyOf`/`allOf`/`not`, `format`,
 //   `minimum`/`maximum` and other numeric constraints, `minLength`/
 //   `maxLength`, `minItems`/`maxItems`, `uniqueItems`, `const`,
-//   `if`/`then`/`else`, `dependentRequired`. `pattern` support would be a
-//   natural, cheap follow-up given `regex` is already a dependency with the
-//   size-bounded compilation this module would want to reuse — not done
-//   here, to keep this change reviewable as one thing at a time.
+//   `if`/`then`/`else`, `dependentRequired`.
+//
+// `pattern` dialect: JSON Schema specifies `pattern` against ECMA 262 regex
+// syntax. Rust's `regex` crate is not ECMA 262 — no backreferences, no
+// lookaround. This is the identical tradeoff `rules_engine.rs` already made
+// and documented for `locked-rules.yaml`/`user-rules.yaml` patterns,
+// specifically because the crate's non-backtracking guarantee (finite
+// automata, not backtracking) is what makes it safe to compile
+// attacker-influenceable patterns at all. A `pattern` using backreferences
+// or lookaround fails to compile, and per the fail-closed rule below, the
+// node it's on is treated as non-conforming, not silently passed.
+//
+// `pattern` bounded compilation: a schema's `pattern` value is untrusted
+// input for the same reason the rest of this module's argument is (see the
+// paragraph below) — `rules_engine.rs` already built the mitigation for
+// CVE-2022-24713 (pathological pattern compilation as a real
+// resource-exhaustion vector, not hypothetical) for exactly this class of
+// problem. This module reuses those same bound *values* (read directly
+// from `rules_engine.rs` at the time of this change: `REGEX_SIZE_LIMIT`
+// and `REGEX_DFA_SIZE_LIMIT` both `1 << 20`, `MAX_PATTERN_SOURCE_LEN` `500`
+// bytes) as its own local constants below — duplicated, not shared, since
+// `rules_engine.rs`'s constants are private to that module and this spec's
+// scope explicitly excludes modifying `rules_engine.rs` to export them; the
+// two modules staying decoupled is a legitimate shape here, not a shortcut.
+//
+// `pattern` failure handling: a `pattern` that fails to compile — bad
+// syntax, or a pattern whose source exceeds `MAX_PATTERN_SOURCE_LEN` or
+// whose compiled form exceeds `REGEX_SIZE_LIMIT`/`REGEX_DFA_SIZE_LIMIT` —
+// makes `check_rec` return `false` for that node, the same as exceeding
+// `MAX_SCHEMA_CHECK_DEPTH` does below. This module's stated philosophy is
+// explicit: if conformance can't be fully verified, it isn't treated as
+// verified. An uncompilable pattern can't be verified, so it isn't silently
+// skipped and treated as passing.
+//
+// `pattern` compiled-pattern caching: deliberately NOT done. `conforms()`
+// is a pure function called fresh per response with no load-once lifecycle
+// to hook a cache into (unlike `rules_engine.rs`, where patterns compile
+// once at `RuleEngine::load` time because the rules files load once at
+// startup). Recompiling a `pattern` regex on every `check_rec` call that
+// reaches one is real, repeated work, but this is a local, single-operator
+// tool with no profiling or reported slowness suggesting it matters yet —
+// noted here as a known, deliberate tradeoff and a real future
+// optimization if it ever does, not a gap being silently ignored now.
 //
 // The schema argument is not fully trusted input: it comes from a tool
 // definition that may not be hash-pinned yet (see hasher.rs — a
@@ -41,9 +81,20 @@
 // hasher.rs already bounds its own canonicalization recursion, for the same
 // reason.
 
+use regex::RegexBuilder;
 use serde_json::Value;
 
 const MAX_SCHEMA_CHECK_DEPTH: u32 = 64;
+
+// Duplicated from rules_engine.rs (REGEX_SIZE_LIMIT, REGEX_DFA_SIZE_LIMIT,
+// MAX_PATTERN_SOURCE_LEN), read directly from that file at the time of this
+// change, not from memory — see the module header above for why these are
+// duplicated locally rather than shared, and CVE-2022-24713 for why the
+// bound exists at all. If rules_engine.rs's values ever change, these must
+// be re-read and updated to match, not assumed to still agree.
+const SCHEMA_PATTERN_SIZE_LIMIT: usize = 1 << 20; // ~1MB compiled-form cap per pattern
+const SCHEMA_PATTERN_DFA_SIZE_LIMIT: usize = 1 << 20;
+const MAX_SCHEMA_PATTERN_SOURCE_LEN: usize = 500;
 
 /// Checks whether `data` structurally conforms to `schema`, per the subset
 /// of JSON Schema described in this module's header comment. Fails CLOSED
@@ -121,10 +172,38 @@ fn check_rec(schema: &Value, data: &Value, depth: u32) -> bool {
                 }
             }
         }
+        Value::String(s) => {
+            if let Some(Value::String(pattern)) = schema_obj.get("pattern") {
+                if !pattern_matches(pattern, s) {
+                    return false;
+                }
+            }
+        }
         _ => {}
     }
 
     true
+}
+
+/// Compiles `pattern` (untrusted — see module header) with the same
+/// CVE-2022-24713 mitigation `rules_engine.rs` uses for its own untrusted
+/// patterns, then checks whether `value` matches. Fails CLOSED (`false`) on
+/// any compilation failure — oversized source, a compiled form exceeding
+/// the size/DFA bounds, or plain invalid regex syntax — per this module's
+/// stated philosophy: an uncompilable pattern can't be verified, so it
+/// isn't treated as passing.
+fn pattern_matches(pattern: &str, value: &str) -> bool {
+    if pattern.len() > MAX_SCHEMA_PATTERN_SOURCE_LEN {
+        return false;
+    }
+    match RegexBuilder::new(pattern)
+        .size_limit(SCHEMA_PATTERN_SIZE_LIMIT)
+        .dfa_size_limit(SCHEMA_PATTERN_DFA_SIZE_LIMIT)
+        .build()
+    {
+        Ok(re) => re.is_match(value),
+        Err(_) => false,
+    }
 }
 
 fn check_type(type_val: &Value, data: &Value) -> bool {
@@ -220,6 +299,57 @@ mod tests {
         let schema = json!({ "enum": ["low", "medium", "high"] });
         assert!(conforms(&schema, &json!("medium")));
         assert!(!conforms(&schema, &json!("extreme")));
+    }
+
+    #[test]
+    fn pattern_constraint_enforced() {
+        let schema = json!({ "pattern": "^[A-Z]{3}$" });
+        assert!(conforms(&schema, &json!("ABC")));
+        assert!(!conforms(&schema, &json!("abc")));
+        assert!(!conforms(&schema, &json!("AB")));
+    }
+
+    #[test]
+    fn pattern_ignored_when_data_is_not_a_string() {
+        // pattern is string-scoped per JSON Schema — a non-string value
+        // doesn't violate it, the same way `items` doesn't apply to an
+        // object and `required` doesn't apply to an array.
+        let schema = json!({ "pattern": "^[A-Z]{3}$" });
+        assert!(conforms(&schema, &json!(42)));
+        assert!(conforms(&schema, &json!(null)));
+        assert!(conforms(&schema, &json!(["AB", "not checked either"])));
+    }
+
+    #[test]
+    fn pattern_with_invalid_regex_syntax_fails_closed() {
+        // Backreferences aren't valid in the regex crate's (non-ECMA-262)
+        // dialect — an uncompilable pattern must fail closed, not be
+        // silently skipped and treated as passing.
+        let schema = json!({ "pattern": "^(a)\\1$" });
+        assert!(!conforms(&schema, &json!("aa")));
+    }
+
+    #[test]
+    fn pattern_exceeding_compiled_size_limit_fails_closed() {
+        // The exact pathological pattern this module's own header (and
+        // rules_engine.rs's CVE-2022-24713 mitigation comment) names:
+        // nested bounded quantifiers blow up the compiled automaton's size
+        // without needing a long source string. Verified directly against
+        // this module's actual reused bound (RegexBuilder::size_limit(1 <<
+        // 20)) before writing this assertion — this pattern's compiled
+        // form measures well over that limit, not assumed to.
+        let schema = json!({ "pattern": "a{100}{100}{100}" });
+        assert!(!conforms(&schema, &json!("aaa")));
+    }
+
+    #[test]
+    fn pattern_composes_with_type_string_both_must_pass() {
+        let schema = json!({ "type": "string", "pattern": "^[A-Z]{3}$" });
+        assert!(conforms(&schema, &json!("ABC")));
+        // Wrong type fails on `type` before `pattern` is even relevant.
+        assert!(!conforms(&schema, &json!(123)));
+        // Right type, wrong pattern — `type` alone isn't enough.
+        assert!(!conforms(&schema, &json!("abc")));
     }
 
     #[test]
