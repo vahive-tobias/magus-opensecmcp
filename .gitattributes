@@ -1,0 +1,21 @@
+# Normalize line endings in the index. Every diff on this repo currently
+# throws "LF will be replaced by CRLF" warnings on a Windows checkout,
+# and a line-ending mismatch already caused one false alarm during a
+# verification pass (a diff appeared to show hundreds of changed lines
+# when the real change was ~35).
+* text=auto
+
+# Rust, config, and docs: explicitly LF in the working tree too, so a
+# file's bytes are the same regardless of which machine checked it out.
+*.rs text eol=lf
+*.toml text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.md text eol=lf
+*.rb text eol=lf
+
+# Test fixtures carry exact byte content into the detection engine on
+# purpose. Do NOT let git rewrite their line endings - that would be a
+# real change to what the corpus tests actually exercise, not a
+# cosmetic one.
+tests/fixtures/** -text
