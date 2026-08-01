@@ -354,10 +354,13 @@ not merged like documentation. Contributions welcome — see below.
       v1 intentionally ships static, config-set grades only.
 - [ ] More than one downstream server exercised in the shipped demo config.
 - [x] Homebrew tap — DONE. `vahive-tobias/homebrew-tap`, formula verified
-      (correct license, version, and a real tested tag/revision pin).
-      Genuinely unverified: an actual `brew install` run on real macOS —
-      neither this project's sandbox nor its Windows dev environment can
-      check that directly.
+      (correct license, version, and a real tested tag/revision pin), now
+      backed by its own CI (`brew tap` → `brew audit --strict` →
+      `brew install --build-from-source` → `brew test` →
+      `--version`/`--help`) running on a real `macos-latest` GitHub Actions
+      runner against the published formula and tag, rerunning on every
+      future formula change — the install path itself is demonstrated now,
+      not asserted.
 - [ ] Packaged release binaries (e.g. prebuilt GitHub Release artifacts
       for Linux/other platforms) — separate from the Homebrew tap above,
       still not done.
