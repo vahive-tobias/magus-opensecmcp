@@ -1,14 +1,14 @@
 // src/quota.rs
 //
-// Local, in-process evaluation counter. Replaces the old Cloudflare-429-based
-// kill switch entirely — there is no remote call in this path, which is the
-// point: governance availability does not depend on a network round trip, and
-// cannot be silently bypassed by a firewall the way a remote-telemetry-driven
-// flag could be.
+// Local, in-process evaluation counter. There is no remote call in this
+// path — governance availability does not depend on a network round trip,
+// and cannot be silently bypassed by a firewall the way a remote check
+// could be.
 //
-// v1 has one free tier and no license concept — this simply exists so the
-// number is visible and the behavior (soft-warn, not hard-lock) is decided
-// deliberately rather than left as an accidental permanent lockout.
+// v1 has a single usage limit and no license concept — this simply exists
+// so the number is visible and the behavior (soft-warn, not hard-lock) is
+// decided deliberately rather than left as an accidental permanent
+// lockout.
 
 use chrono::{Datelike, Utc};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -31,8 +31,7 @@ impl QuotaCounter {
 
     /// Records one evaluation and returns the count so far this period.
     /// Resets automatically the first time it's called after a real calendar
-    /// month boundary — no restart required, unlike the daemon's rate_limited
-    /// AtomicBool this replaces, which had no reset path at all.
+    /// month boundary — no separate reset step or external trigger required.
     pub fn record_and_get_count(&self) -> u32 {
         let now_period = period_key();
         if now_period != self.current_period.load(Ordering::Relaxed) {

@@ -19,7 +19,7 @@ use magus_opensecmcp::membrane::{Membrane, Proposal};
 use magus_opensecmcp::pin_policy::{self, PinStatus};
 use magus_opensecmcp::provenance::{self, AgentProvenanceTracker, SchemaConformance};
 
-const FREE_TIER_MAX_AGENTS: usize = 3;
+const DEFAULT_MAX_AGENTS: usize = 3;
 const DEFAULT_MONTHLY_EVAL_LIMIT: u32 = 5_000;
 
 /// Everything discovery produces for one downstream server: real tool
@@ -285,7 +285,7 @@ async fn main() -> Result<()> {
     // ---- Core governance components ----
     let session_id = Uuid::new_v4().to_string();
     let audit_logger = Arc::new(AuditLogger::new(&session_id));
-    let membrane = Arc::new(Mutex::new(Membrane::new(session_id.clone(), FREE_TIER_MAX_AGENTS, DEFAULT_MONTHLY_EVAL_LIMIT)));
+    let membrane = Arc::new(Mutex::new(Membrane::new(session_id.clone(), DEFAULT_MAX_AGENTS, DEFAULT_MONTHLY_EVAL_LIMIT)));
     let connection_id = Uuid::new_v4();
     {
         let mut mem = membrane.lock().await;
