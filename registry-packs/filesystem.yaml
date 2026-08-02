@@ -2,11 +2,9 @@
 #
 # Pack: "mcp-server-filesystem"
 # Pack source: https://www.npmjs.com/package/@modelcontextprotocol/server-filesystem
-# Verified: 2026-07, run end-to-end against the real published package,
-# not written from documentation or memory. Every hash below is the real
-# output of the gateway's own hasher against the real server's real
-# tools/list response.
-#
+# Verified: 2026-07, run end-to-end against the real published package. 
+# Every hash below is the real output of the gateway's own hasher
+# against the real server's real tools/list response.
 # A pack is a trust claim, not a guarantee, a wrong classification shipped
 # under a "curated" banner is worse than a user guessing on their own. This
 # is currently the one pack in the repo verified end-to-end; treat any other
