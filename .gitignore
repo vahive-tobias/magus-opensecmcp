@@ -3,4 +3,5 @@
 .DS_Store
 CLAUDE.md
 /docs/specs/
+/docs/rule-calibration/
 user-rules.yaml
