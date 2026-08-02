@@ -52,7 +52,29 @@ pub enum ProvenanceState {
 
 const LONG_STRING_THRESHOLD: usize = 200;
 const AGGREGATE_STRING_BYTES_CAP: u32 = 800;
-const DECAY_MULTIPLIER: f64 = 1.5;
+
+/// Number of consecutive, independently-verified-clean responses required
+/// to decay one tier — `Contaminated -> Elevated` needs
+/// `CLEAN_CALLS_TO_DECAY_CONTAMINATED`, `Elevated -> Clean` needs
+/// `CLEAN_CALLS_TO_DECAY_ELEVATED`. A stricter bar for undoing heuristic
+/// evidence (the transition F1's "decay bombing" exploit actually
+/// targeted — see `docs/specs/Adversarial Review magus-opensecmcp.md` and
+/// `docs/specs/spec-f1-clean-call-decay.md`) than for the lower-stakes
+/// "read some stuff, nothing happened" tier.
+///
+/// CALIBRATION GUESS, not asserted as correct — same disclaiming language
+/// membrane.rs's 135%/150% BP surcharges already use. Unlike `entropy_gt`
+/// in `SECRET-GH-001` (measured against real/fake sample distributions,
+/// documented in `docs/rule-calibration/`), there is no dataset these
+/// numbers are fit to: this is a judgment call about how much sustained
+/// good behavior should count as earned trust back, not a measured
+/// detection threshold. **No `docs/rule-calibration/` entry should be
+/// expected for these** — there's nothing to measure them against, and
+/// someone shouldn't go looking for evidence that was never meant to
+/// exist. Same reasoning as the companion F2 fix's
+/// `MAX_OCCURRENCES_PER_RULE` (`rules_engine.rs`).
+const CLEAN_CALLS_TO_DECAY_CONTAMINATED: u32 = 5;
+const CLEAN_CALLS_TO_DECAY_ELEVATED: u32 = 3;
 
 /// Computes the structural taint of a raw tool response payload. O(n) in
 /// response size. No AI model calls, no semantic understanding.
@@ -226,10 +248,37 @@ pub fn state_from_rule_hits(summary: &RuleHitSummary, current_state: ProvenanceS
 }
 
 /// Tracks the provenance state for a specific agent connection.
+///
+/// F1 residual risk, stated with an actual number, not just a category
+/// shift (see `docs/specs/spec-f1-clean-call-decay.md`): this fix converts
+/// the "decay bombing" bypass from FREE and computational (one
+/// agent-controlled local value, zero server involvement — the original
+/// bug) to EXPENSIVE and behavioral (`K` real round trips, real BP, a real
+/// audit trail, real replay protection). It does not make
+/// server-cooperated laundering impossible — an attacker who already
+/// controls the malicious server can have it emit `K` genuinely boring
+/// responses on purpose. At the starting constants, the minimal repeat of
+/// the original exploit's maneuver needs one `Contaminated -> Elevated`
+/// decay (`CLEAN_CALLS_TO_DECAY_CONTAMINATED` = 5 calls, not a full trip to
+/// `Clean`) before the next real signal: `5 x 200` BP (`Low`-risk base
+/// cost) `= 1,000` BP per launder cycle. Against a `9,500` BP floor
+/// (`membrane::RISK_FLOOR_BP`) with no other activity, that bounds a
+/// patient attacker to roughly 8-9 repetitions of "launder, then strike"
+/// before the floor alone ends the session — fewer in practice, since both
+/// the strikes and any other traffic also consume budget. A real,
+/// quantifiable, non-trivial cost and a genuine one-way door compared to
+/// today's unlimited free repetition — but a bound, not a wall. Don't read
+/// this as claiming the exploit is closed unqualified.
 pub struct AgentProvenanceTracker {
     pub current_state: ProvenanceState,
-    pub bytes_since_elevation: usize,
-    pub decay_threshold: usize,
+    /// Consecutive responses, since the last escalation or decay, that were
+    /// independently verified clean (see `record_response_outcome`) — NOT
+    /// a count of calls in general, and never incremented by
+    /// `ingest_signature`. Replaces the removed `bytes_since_elevation` /
+    /// `decay_threshold` (agent-controlled outbound byte count) entirely;
+    /// see this fix's spec for why that was the actual category error, not
+    /// just a miscalibrated number.
+    pub clean_calls_since_elevation: u32,
     pub poisoning_server_id: Option<String>,
     /// ids of any rules.yaml rules responsible for the most recent state
     /// escalation, if any. Empty when the last escalation (if any) was
@@ -247,8 +296,7 @@ impl AgentProvenanceTracker {
     pub fn new() -> Self {
         Self {
             current_state: ProvenanceState::Clean,
-            bytes_since_elevation: 0,
-            decay_threshold: 0,
+            clean_calls_since_elevation: 0,
             poisoning_server_id: None,
             last_triggering_rule_ids: Vec::new(),
         }
@@ -257,14 +305,11 @@ impl AgentProvenanceTracker {
     pub fn ingest_signature(
         &mut self,
         new_state: ProvenanceState,
-        ingress_bytes: usize,
         mcp_server_id: &str,
         triggering_rule_ids: &[String],
     ) {
         if new_state > self.current_state {
             self.current_state = new_state;
-            self.bytes_since_elevation = 0;
-            self.decay_threshold = (ingress_bytes as f64 * DECAY_MULTIPLIER) as usize;
             self.last_triggering_rule_ids = triggering_rule_ids.to_vec();
             if new_state == ProvenanceState::Poisoned {
                 self.poisoning_server_id = Some(mcp_server_id.to_string());
@@ -272,19 +317,58 @@ impl AgentProvenanceTracker {
         }
     }
 
-    /// Called ONLY on the success path of a proposal evaluation. An agent
-    /// cannot farm decay credit through a rejection at zero BP cost.
-    pub fn record_outbound_and_decay(&mut self, egress_bytes: usize) {
+    /// Decay driven by verified-clean ROUND TRIPS, not agent-declared
+    /// egress size — see `docs/specs/spec-f1-clean-call-decay.md` for why
+    /// the byte-based version this replaced was a free bypass ("decay
+    /// bombing"). `this_call_state` is `structural_state.max(hit_state)`
+    /// for THIS SPECIFIC call's response, independent of
+    /// `self.current_state` — the same `new_state` value passed to
+    /// `ingest_signature` for the same response.
+    ///
+    /// Escalation and healing-progress are mutually exclusive per
+    /// response, by construction of the if/return below, not by
+    /// coincidence of how the two functions happen to be called: either
+    /// this call's own response is worse than `Elevated` (branch 1 —
+    /// state may go UP via `ingest_signature`, streak resets) or it isn't
+    /// (branch 2 — state may go DOWN here, streak progresses) — never
+    /// both for the same response.
+    ///
+    /// `Poisoned` never decays under any number of clean calls — checked
+    /// first, unconditionally; this invariant is unchanged by this fix.
+    pub fn record_response_outcome(&mut self, this_call_state: ProvenanceState) {
         if self.current_state == ProvenanceState::Poisoned { return; }
 
-        self.bytes_since_elevation += egress_bytes;
-        if self.bytes_since_elevation > self.decay_threshold {
-            self.current_state = match self.current_state {
-                ProvenanceState::Contaminated => ProvenanceState::Elevated,
-                ProvenanceState::Elevated => ProvenanceState::Clean,
-                _ => self.current_state,
-            };
-            self.bytes_since_elevation = 0;
+        // Fires even when `this_call_state` isn't strictly greater than
+        // `self.current_state` and therefore wouldn't itself escalate
+        // anything via `ingest_signature` — deliberately reads only
+        // `this_call_state`, never compares it against
+        // `self.current_state`. A fresh signal no worse than the current
+        // state is still evidence the environment isn't clean, and must
+        // still cost the healing progress, not be silently absorbed. This
+        // is the detail that actually closes the loophole a less careful
+        // version of this fix would leave open: without it, an attacker
+        // could interleave sub-threshold noise between clean calls at no
+        // cost while still progressing the streak.
+        if this_call_state > ProvenanceState::Elevated {
+            self.clean_calls_since_elevation = 0;
+            return;
+        }
+
+        // this_call_state <= Elevated: genuinely nothing fired this call.
+        // `Clean` has no lower tier to decay into, so it isn't in this
+        // table — nothing accrues while already at the floor.
+        let tier = match self.current_state {
+            ProvenanceState::Contaminated => Some((CLEAN_CALLS_TO_DECAY_CONTAMINATED, ProvenanceState::Elevated)),
+            ProvenanceState::Elevated => Some((CLEAN_CALLS_TO_DECAY_ELEVATED, ProvenanceState::Clean)),
+            _ => None,
+        };
+
+        if let Some((threshold, next_state)) = tier {
+            self.clean_calls_since_elevation += 1;
+            if self.clean_calls_since_elevation >= threshold {
+                self.current_state = next_state;
+                self.clean_calls_since_elevation = 0;
+            }
         }
     }
 }
@@ -619,7 +703,7 @@ mod tests {
     #[test]
     fn ingest_signature_only_escalates_and_a_noop_does_not_clobber_rule_ids() {
         let mut tracker = AgentProvenanceTracker::new();
-        tracker.ingest_signature(ProvenanceState::Elevated, 100, "server-a", &["RULE-A".to_string()]);
+        tracker.ingest_signature(ProvenanceState::Elevated, "server-a", &["RULE-A".to_string()]);
         assert_eq!(tracker.current_state, ProvenanceState::Elevated);
         assert_eq!(tracker.last_triggering_rule_ids, vec!["RULE-A".to_string()]);
 
@@ -627,7 +711,7 @@ mod tests {
         // (Elevated). current_state must be unchanged AND
         // last_triggering_rule_ids must NOT be overwritten by this call's
         // (irrelevant) rule ids.
-        tracker.ingest_signature(ProvenanceState::Clean, 999, "server-b", &["RULE-B".to_string()]);
+        tracker.ingest_signature(ProvenanceState::Clean, "server-b", &["RULE-B".to_string()]);
         assert_eq!(tracker.current_state, ProvenanceState::Elevated, "a non-escalating ingest must not change current_state");
         assert_eq!(
             tracker.last_triggering_rule_ids,
@@ -637,7 +721,7 @@ mod tests {
 
         // Same-state ingest (Elevated -> Elevated) is also a no-op, since
         // the check is strictly `new_state > current_state`.
-        tracker.ingest_signature(ProvenanceState::Elevated, 999, "server-c", &["RULE-C".to_string()]);
+        tracker.ingest_signature(ProvenanceState::Elevated, "server-c", &["RULE-C".to_string()]);
         assert_eq!(
             tracker.last_triggering_rule_ids,
             vec!["RULE-A".to_string()],
@@ -645,82 +729,145 @@ mod tests {
         );
     }
 
-    #[test]
-    fn decay_threshold_is_set_from_ingress_bytes_and_decay_multiplier_on_escalation() {
-        let mut tracker = AgentProvenanceTracker::new();
-        tracker.ingest_signature(ProvenanceState::Elevated, 100, "server-a", &[]);
-        assert_eq!(tracker.decay_threshold, (100.0 * DECAY_MULTIPLIER) as usize);
-    }
-
     /// Hard invariant, not a threshold: Poisoned never decays under ANY
-    /// amount of egress, including an absurdly large one — confirming
-    /// there is no path back from Poisoned at all, not merely finding
-    /// where decay happens to resume.
+    /// number of independently-clean calls, including an absurd number of
+    /// them — confirming there is no path back from Poisoned at all, not
+    /// merely finding where decay happens to resume. Carried over verbatim
+    /// (same assertion, same spirit) from the byte-threshold mechanism this
+    /// replaces, per docs/specs/spec-f1-clean-call-decay.md's requirement
+    /// that this invariant stay unchanged and re-exercised against the new
+    /// mechanism, not just conceptually.
     #[test]
-    fn poisoned_never_decays_even_with_an_absurdly_large_egress_value() {
+    fn poisoned_never_decays_even_with_an_absurd_number_of_clean_calls() {
         let mut tracker = AgentProvenanceTracker::new();
-        tracker.ingest_signature(ProvenanceState::Poisoned, 10, "server-a", &["MCT-001".to_string()]);
+        tracker.ingest_signature(ProvenanceState::Poisoned, "server-a", &["MCT-001".to_string()]);
         assert_eq!(tracker.current_state, ProvenanceState::Poisoned);
 
-        tracker.record_outbound_and_decay(usize::MAX / 2);
+        tracker.record_response_outcome(ProvenanceState::Clean);
         assert_eq!(
             tracker.current_state,
             ProvenanceState::Poisoned,
-            "Poisoned must not decay even under a single absurdly large egress value"
+            "Poisoned must not decay even after a single verified-clean response"
         );
 
-        // Confirm repeatedly too, not just once — there is no path back at all.
-        for _ in 0..5 {
-            tracker.record_outbound_and_decay(usize::MAX / 2);
+        // Confirm repeatedly too, not just once — there is no path back at
+        // all, no matter how many clean calls follow (10,000, well past any
+        // real CLEAN_CALLS_TO_DECAY_* threshold).
+        for _ in 0..10_000 {
+            tracker.record_response_outcome(ProvenanceState::Clean);
         }
         assert_eq!(
             tracker.current_state,
             ProvenanceState::Poisoned,
-            "Poisoned must not decay no matter how much accumulated egress follows"
+            "Poisoned must not decay no matter how many consecutive clean calls follow"
         );
     }
 
+    /// THE direct F1 regression test: a single call — however large its
+    /// arguments, since egress size is no longer read by this mechanism at
+    /// all — must not decay Contaminated. Formalizes the original
+    /// adversarial review's "decay bombing" proof-of-concept: one cheap,
+    /// padded call used to be enough to launder Contaminated back to
+    /// Elevated for free. Under the new mechanism, ONE clean call
+    /// contributes exactly one count toward CLEAN_CALLS_TO_DECAY_CONTAMINATED
+    /// (5) and cannot alone cross that threshold.
     #[test]
-    fn contaminated_decays_to_elevated_once_egress_exceeds_threshold() {
+    fn single_clean_call_does_not_decay_contaminated() {
         let mut tracker = AgentProvenanceTracker::new();
-        tracker.ingest_signature(ProvenanceState::Contaminated, 100, "server-a", &[]);
-        let threshold = tracker.decay_threshold;
-        tracker.record_outbound_and_decay(threshold + 1);
-        assert_eq!(tracker.current_state, ProvenanceState::Elevated);
+        tracker.ingest_signature(ProvenanceState::Contaminated, "server-a", &["DSO-001".to_string()]);
+        assert_eq!(tracker.current_state, ProvenanceState::Contaminated);
+
+        tracker.record_response_outcome(ProvenanceState::Clean);
+        assert_eq!(
+            tracker.current_state,
+            ProvenanceState::Contaminated,
+            "THE F1 REGRESSION: a single clean call must not decay Contaminated — under the old \
+             byte-threshold mechanism, one call with a large enough argument payload did exactly \
+             this for free"
+        );
+        assert_eq!(tracker.clean_calls_since_elevation, 1);
     }
 
     #[test]
-    fn elevated_decays_to_clean_once_egress_exceeds_threshold() {
+    fn k_consecutive_clean_calls_decay_one_tier_and_reset_the_counter() {
         let mut tracker = AgentProvenanceTracker::new();
-        tracker.ingest_signature(ProvenanceState::Elevated, 100, "server-a", &[]);
-        let threshold = tracker.decay_threshold;
-        tracker.record_outbound_and_decay(threshold + 1);
-        assert_eq!(tracker.current_state, ProvenanceState::Clean);
-    }
+        tracker.ingest_signature(ProvenanceState::Contaminated, "server-a", &["DSO-001".to_string()]);
 
-    #[test]
-    fn below_threshold_egress_leaves_state_unchanged_and_accumulates_across_calls() {
-        let mut tracker = AgentProvenanceTracker::new();
-        tracker.ingest_signature(ProvenanceState::Elevated, 100, "server-a", &[]);
-        let threshold = tracker.decay_threshold;
-        assert!(threshold > 2, "test assumes a threshold large enough to split across two below-threshold calls");
+        for i in 1..CLEAN_CALLS_TO_DECAY_CONTAMINATED {
+            tracker.record_response_outcome(ProvenanceState::Clean);
+            assert_eq!(
+                tracker.current_state,
+                ProvenanceState::Contaminated,
+                "must not decay before the {}th consecutive clean call", i
+            );
+            assert_eq!(tracker.clean_calls_since_elevation, i);
+        }
 
-        let half = threshold / 2;
-        tracker.record_outbound_and_decay(half);
-        assert_eq!(tracker.current_state, ProvenanceState::Elevated, "a single below-threshold call must not decay");
-        assert_eq!(tracker.bytes_since_elevation, half, "bytes_since_elevation must accumulate, not reset, below threshold");
-
-        // The second call is individually below threshold too, and the
-        // ACCUMULATED total (half + (threshold - half) == threshold
-        // exactly) is still not strictly GREATER than threshold, so this
-        // must still not decay — this is the precise boundary, not just
-        // "comfortably below".
-        tracker.record_outbound_and_decay(threshold - half);
+        // The Kth consecutive clean call decays one tier and resets the counter.
+        tracker.record_response_outcome(ProvenanceState::Clean);
         assert_eq!(
             tracker.current_state,
             ProvenanceState::Elevated,
-            "accumulated bytes exactly at threshold must not decay (the check is strictly greater-than)"
+            "the Kth consecutive clean call must decay Contaminated -> Elevated"
         );
-        assert_eq!(tracker.bytes_since_elevation, threshold);
+        assert_eq!(tracker.clean_calls_since_elevation, 0, "the counter must reset to zero after decaying");
+
+        // Decaying again, Elevated -> Clean, at the (different, smaller) K for that tier.
+        for i in 1..CLEAN_CALLS_TO_DECAY_ELEVATED {
+            tracker.record_response_outcome(ProvenanceState::Clean);
+            assert_eq!(tracker.current_state, ProvenanceState::Elevated, "must not decay before the {}th consecutive clean call", i);
+        }
+        tracker.record_response_outcome(ProvenanceState::Clean);
+        assert_eq!(tracker.current_state, ProvenanceState::Clean, "the Kth consecutive clean call must decay Elevated -> Clean");
+        assert_eq!(tracker.clean_calls_since_elevation, 0);
+    }
+
+    /// THE loophole-closing case, per docs/specs/spec-f1-clean-call-decay.md:
+    /// a fresh but non-escalating hit (new_state <= tracker.current_state,
+    /// but still > Elevated — i.e., still real heuristic evidence) must
+    /// reset the streak to zero, even though tracker.current_state itself
+    /// doesn't change as a result (ingest_signature only mutates on strict
+    /// escalation). Without this, an attacker could interleave
+    /// sub-threshold noise between clean calls at no cost while still
+    /// progressing the streak toward decay.
+    #[test]
+    fn non_escalating_fresh_hit_still_resets_the_streak() {
+        let mut tracker = AgentProvenanceTracker::new();
+        tracker.ingest_signature(ProvenanceState::Contaminated, "server-a", &["DSO-001".to_string()]);
+
+        // Build up partial progress toward decay.
+        tracker.record_response_outcome(ProvenanceState::Clean);
+        tracker.record_response_outcome(ProvenanceState::Clean);
+        assert_eq!(tracker.clean_calls_since_elevation, 2);
+
+        // A fresh Contaminated-level hit: new_state (Contaminated) is NOT
+        // strictly greater than tracker.current_state (already
+        // Contaminated), so ingest_signature would be a no-op here and
+        // current_state doesn't change — but it must still reset the streak.
+        assert_eq!(tracker.current_state, ProvenanceState::Contaminated, "test setup sanity check");
+        tracker.record_response_outcome(ProvenanceState::Contaminated);
+        assert_eq!(
+            tracker.clean_calls_since_elevation, 0,
+            "a fresh non-escalating hit (new_state == current_state, still > Elevated) must reset \
+             the streak to zero, not be silently absorbed"
+        );
+        assert_eq!(
+            tracker.current_state,
+            ProvenanceState::Contaminated,
+            "current_state itself is unchanged by this non-escalating hit — only the streak resets"
+        );
+
+        // Confirm the reset actually cost progress: 4 more clean calls
+        // (not 3) are now needed to reach CLEAN_CALLS_TO_DECAY_CONTAMINATED.
+        for _ in 0..(CLEAN_CALLS_TO_DECAY_CONTAMINATED - 1) {
+            tracker.record_response_outcome(ProvenanceState::Clean);
+        }
+        assert_eq!(
+            tracker.current_state,
+            ProvenanceState::Contaminated,
+            "must still not have decayed — the reset means the streak restarted from zero"
+        );
+        tracker.record_response_outcome(ProvenanceState::Clean);
+        assert_eq!(tracker.current_state, ProvenanceState::Elevated, "must decay once the full K is reached AFTER the reset");
     }
 }

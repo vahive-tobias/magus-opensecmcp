@@ -53,6 +53,40 @@ const REGEX_SIZE_LIMIT: usize = 1 << 20; // ~1MB compiled-form cap per pattern
 const REGEX_DFA_SIZE_LIMIT: usize = 1 << 20;
 const MAX_PATTERN_SOURCE_LEN: usize = 500;
 
+/// A resource bound, not a calibrated detection threshold — unlike
+/// `entropy_gt` or the F1 fix's `K_contaminated` (see
+/// `docs/rule-calibration/`), this isn't making a detection judgment, so it
+/// gets no `docs/rule-calibration/` entry: that directory is for
+/// evidence-based detection calibration, and this constant has no dataset
+/// it's fit to. It needs to be generously large for legitimate use and
+/// small enough to bound worst-case allocation cost, full stop.
+///
+/// Why the bound exists at all: `regex`'s linear-time guarantee means total
+/// match-SCANNING work across all occurrences of one pattern is `O(input
+/// length)` regardless of match count (`CVE-2022-24713`, mitigated above,
+/// is a compile-time concern, not a per-match one) — the real cost bounded
+/// here is a permissive pattern (especially operator-authored, in
+/// user-rules.yaml — a short literal or a loose regex like `curl`) matching
+/// an enormous number of times in one large payload, each occurrence
+/// triggering real per-occurrence work (`to_lowercase()`, and a
+/// heap-allocating Shannon entropy computation when `escalate_if` is
+/// configured). Applies to both the regex and literal (Aho-Corasick) scan
+/// paths — see `scan()`.
+///
+/// Residual gap, stated plainly rather than implying this closes the hole
+/// perfectly: an attacker could in principle bury a real secret past
+/// occurrence #N behind N repeats of a known placeholder string, since only
+/// the strongest of the first `MAX_OCCURRENCES_PER_RULE` occurrences is
+/// ever evaluated per rule (see `scan()`/`strongest()`). This is a real,
+/// bounded residual, structurally different from the bug this fix closes —
+/// before, it cost ONE occurrence anywhere in the response to hide a real
+/// secret behind an earlier exemption; now it costs hundreds of
+/// conspicuous, suspicious-shaped repeats of a known placeholder in one
+/// response, which is likely to independently trip
+/// `AGGREGATE_STRING_BYTES_CAP`/long-string structural elevation in
+/// `provenance.rs` even if this specific rule stays silent.
+const MAX_OCCURRENCES_PER_RULE: usize = 256;
+
 /// Synthesis threshold: this many medium-or-above hits, spanning this many
 /// distinct categories, in one response, is treated as a single high-severity
 /// hit by provenance::state_from_rule_hits. Keeps a pile of individually
@@ -106,22 +140,18 @@ pub enum Scope {
 /// deserialize error on that line, which fails closed like any other broken
 /// rule, rather than opening a live bypass. See provenance::state_from_rule_hits
 /// for how `Action` maps onto FSM transitions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+///
+/// `Flag < Elevate < Poison` — declaration order is deliberate and depended
+/// on by two call sites: `weaker_action` (a suppression can only move an
+/// action toward `Flag`, i.e. take the min) and `scan()`'s multi-occurrence
+/// reduction in `strongest()` (the strongest occurrence of a rule wins,
+/// i.e. take the max). Reordering these variants silently changes both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Action {
     Flag,
     Elevate,
     Poison,
-}
-
-impl Action {
-    fn rank(self) -> u8 {
-        match self {
-            Action::Flag => 0,
-            Action::Elevate => 1,
-            Action::Poison => 2,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -228,6 +258,17 @@ struct CompiledRule {
 }
 
 /// One rule hit, post-suppression.
+///
+/// Invariant: a `scan()` produces at most one `HitDetail` per rule id, and
+/// that entry reflects the STRONGEST QUALIFYING OCCURRENCE of the rule's
+/// pattern in the scanned text, not merely the first one found — see
+/// `scan()`, `evaluate_occurrence()`, and `strongest()`. This is a
+/// deliberate design choice: it fixes detection completeness (a real
+/// secret appearing after an exempted placeholder is no longer invisible
+/// to the scan just because the exemption consumed the only match
+/// attempt) without changing what feeds `provenance.rs`'s corroboration
+/// math, which assumes one signal per distinct rule — occurrence COUNT
+/// deliberately never leaks past this reduction.
 #[derive(Debug, Clone)]
 pub struct HitDetail {
     pub rule_id: String,
@@ -237,6 +278,8 @@ pub struct HitDetail {
     pub suppressed_from: Option<Severity>,
 }
 
+/// Holds at most one `HitDetail` per rule id — see the invariant on
+/// `HitDetail` above.
 #[derive(Debug, Default)]
 pub struct RuleHitSummary {
     pub hits: Vec<HitDetail>,
@@ -482,24 +525,54 @@ impl RuleEngine {
         let lower = normalized_text.to_lowercase();
         let mut hits = Vec::new();
 
+        // One HitDetail per literal rule — the strongest occurrence, not
+        // merely the first (see the invariant on HitDetail above). The
+        // Aho-Corasick automaton finds every occurrence of every literal
+        // pattern in a single pass (that's the point of a shared
+        // automaton); this groups those occurrences by which rule they
+        // belong to (`literal_best`/`literal_occurrences`, indexed the same
+        // way as `literal_rules`) rather than re-scanning once per rule.
+        // Iterating `literal_best` in index order at the end keeps output
+        // order equal to rule declaration order, matching the regex loop
+        // below and avoiding the nondeterministic ordering a HashMap keyed
+        // by rule index would introduce.
+        let mut literal_best: Vec<Option<HitDetail>> = vec![None; self.literal_rules.len()];
+        let mut literal_occurrences: Vec<usize> = vec![0; self.literal_rules.len()];
         for m in self.literal_automaton.find_iter(&lower) {
-            let rule = &self.literal_rules[m.pattern().as_usize()];
-            if rule_applies(rule.scope, scope) {
-                // Literal matching is always case-insensitive (see the note
-                // on MatchType::Literal above), so the matched span's own
-                // "true" text IS its lowercased form here — there's no
-                // separate original-case text to recover for this match
-                // kind, unlike regex matches below.
-                let matched_text = &lower[m.start()..m.end()];
-                push_hit(&mut hits, rule, matched_text, &self.suppressions, mcp_server_id);
+            let idx = m.pattern().as_usize();
+            let rule = &self.literal_rules[idx];
+            if !rule_applies(rule.scope, scope) { continue; }
+            if literal_occurrences[idx] >= MAX_OCCURRENCES_PER_RULE { continue; }
+            literal_occurrences[idx] += 1;
+            // Literal matching is always case-insensitive (see the note
+            // on MatchType::Literal above), so the matched span's own
+            // "true" text IS its lowercased form here — there's no
+            // separate original-case text to recover for this match
+            // kind, unlike regex matches below.
+            let matched_text = &lower[m.start()..m.end()];
+            if let Some(candidate) = evaluate_occurrence(rule, matched_text, &self.suppressions, mcp_server_id) {
+                literal_best[idx] = strongest(literal_best[idx].take(), candidate);
             }
         }
+        hits.extend(literal_best.into_iter().flatten());
+
+        // One HitDetail per regex rule, same reduction — see F2 in
+        // docs/specs/Adversarial Review magus-opensecmcp.md and
+        // docs/specs/spec-f2-multi-occurrence-scan.md: `re.find()` (single
+        // match) meant an exempted placeholder occurring before a real
+        // secret consumed the only scan attempt, leaving the real secret
+        // after it never evaluated at all. `find_iter().take(N)` fixes
+        // that by considering every occurrence up to the bound, keeping
+        // only the strongest.
         for (re, rule) in &self.regex_rules {
-            if rule_applies(rule.scope, scope) {
-                if let Some(m) = re.find(normalized_text) {
-                    push_hit(&mut hits, rule, m.as_str(), &self.suppressions, mcp_server_id);
+            if !rule_applies(rule.scope, scope) { continue; }
+            let mut best: Option<HitDetail> = None;
+            for m in re.find_iter(normalized_text).take(MAX_OCCURRENCES_PER_RULE) {
+                if let Some(candidate) = evaluate_occurrence(rule, m.as_str(), &self.suppressions, mcp_server_id) {
+                    best = strongest(best, candidate);
                 }
             }
+            if let Some(hit) = best { hits.push(hit); }
         }
 
         RuleHitSummary { hits }
@@ -510,29 +583,35 @@ fn rule_applies(rule_scope: Scope, requested_scope: Scope) -> bool {
     matches!(rule_scope, Scope::Any) || rule_scope == requested_scope
 }
 
-/// Applies, in order: `exempt_if_contains` (drop the hit entirely if the
+/// Evaluates ONE matched occurrence of `rule` and returns the resulting
+/// `HitDetail`, or `None` if this occurrence is exempted. Applies, in
+/// order: `exempt_if_contains` (drop this occurrence entirely if the
 /// matched span contains any listed substring, case-insensitively — a
 /// known-inert placeholder is not a signal worth logging even at `flag`),
-/// then `escalate_if` (bump the action for the hits that remain if the
-/// matched span's Shannon entropy clears the configured bar), then
-/// suppression exactly as before. This order matters: suppression must see
-/// the already-exempted/escalated action, not the raw rule default, and
-/// exemption must run before entropy is even computed since an exempted hit
-/// never becomes a `HitDetail` at all.
-fn push_hit(
-    hits: &mut Vec<HitDetail>,
+/// then `escalate_if` (bump the action if the matched span's Shannon
+/// entropy clears the configured bar), then suppression exactly as before.
+/// This order matters: suppression must see the already-exempted/escalated
+/// action, not the raw rule default, and exemption must run before entropy
+/// is even computed since an exempted occurrence never becomes a
+/// `HitDetail` at all.
+///
+/// Called once per occurrence, up to `MAX_OCCURRENCES_PER_RULE` times per
+/// rule per `scan()`. This function has no notion of "the strongest
+/// occurrence of this rule" — that reduction happens in `scan()` via
+/// `strongest()`, across however many `Option<HitDetail>`s this produces.
+fn evaluate_occurrence(
     rule: &CompiledRule,
     matched_text: &str,
     suppressions: &[SuppressionDef],
     mcp_server_id: &str,
-) {
+) -> Option<HitDetail> {
     let matched_lower = matched_text.to_lowercase();
     if rule
         .exempt_if_contains
         .iter()
         .any(|needle| matched_lower.contains(&needle.to_lowercase()))
     {
-        return;
+        return None;
     }
 
     let effective_action = match &rule.escalate_if {
@@ -554,13 +633,36 @@ fn push_hit(
         None => (rule.severity, effective_action, None),
     };
 
-    hits.push(HitDetail {
+    Some(HitDetail {
         rule_id: rule.id.clone(),
         category: rule.category.clone(),
         severity,
         action,
         suppressed_from,
-    });
+    })
+}
+
+/// Reduces an in-progress best-so-far occurrence (`current` — `None` if no
+/// qualifying occurrence of this rule has been seen yet) and a newly
+/// evaluated `candidate` occurrence to whichever is stronger, by `action`
+/// first (`Poison > Elevate > Flag`, via `Action`'s derived `Ord`), then
+/// `severity` as a documented, currently INERT tiebreaker: severity is
+/// fixed per rule per scan today, only `action` varies (via
+/// `escalate_if`), so the severity comparison below is not exercised by
+/// any current test path. Kept anyway so it means something correct
+/// rather than nothing, if a future feature ever makes severity
+/// occurrence-dependent.
+fn strongest(current: Option<HitDetail>, candidate: HitDetail) -> Option<HitDetail> {
+    match current {
+        None => Some(candidate),
+        Some(current) => {
+            if (candidate.action, candidate.severity) > (current.action, current.severity) {
+                Some(candidate)
+            } else {
+                Some(current)
+            }
+        }
+    }
 }
 
 /// Shannon entropy in bits per character over `s`'s character distribution:
@@ -588,13 +690,14 @@ fn shannon_entropy(s: &str) -> f64 {
 }
 
 /// Suppression can only move a hit TOWARD `Flag`, never past it — there is
-/// no way to reach a fully-silent outcome through this path.
+/// no way to reach a fully-silent outcome through this path. Simplifies to
+/// `original.min(floor)` now that `Action` derives `Ord`: confirmed
+/// equivalent to the previous hand-rolled `rank()` comparison, including
+/// the equal case (`original == floor`), where the old code took the
+/// `else` branch and returned `floor` — behaviorally identical to `min`
+/// returning either operand when they're equal.
 fn weaker_action(original: Action, floor: Action) -> Action {
-    if original.rank() < floor.rank() {
-        original
-    } else {
-        floor
-    }
+    original.min(floor)
 }
 
 fn downgrade_severity(s: Severity) -> Severity {
@@ -846,6 +949,101 @@ mod tests {
             Action::Flag,
             "a match whose entropy does not exceed entropy_gt must stay at the rule's base action"
         );
+    }
+
+    /// F2's `MAX_OCCURRENCES_PER_RULE` cap: a permissive pattern against a
+    /// large, pathological payload (a single character repeated a million
+    /// times, matching at nearly every position) must still terminate
+    /// quickly rather than degrade into unbounded per-occurrence work — a
+    /// heap-allocating Shannon entropy computation per match, here, via
+    /// `escalate_if`. Asserted on wall-clock time, deliberately: the
+    /// `scan()` -> `RuleHitSummary` reduction always yields at most one
+    /// `HitDetail` per rule by design, regardless of whether the cap
+    /// actually engaged, so hit count alone can't distinguish "capped at
+    /// `MAX_OCCURRENCES_PER_RULE`" from "processed all million occurrences
+    /// and then collapsed them" — only elapsed time actually distinguishes
+    /// those two cases from outside the module.
+    #[test]
+    fn pathological_pattern_against_large_payload_stays_bounded() {
+        let dir = std::env::temp_dir().join(format!("magus-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("user-rules.yaml");
+        std::fs::write(
+            &path,
+            "rules:\n  - id: TEST-CAP-001\n    category: test\n    severity: medium\n    match: { type: regex, pattern: \"a\" }\n    action: flag\n    case_sensitive: true\n    escalate_if: { entropy_gt: 3.5, escalated_action: elevate }\n",
+        )
+        .unwrap();
+        let engine = RuleEngine::load(Some(&path)).expect("valid user-rules.yaml must load");
+
+        let payload = "a".repeat(1_000_000);
+
+        let start = std::time::Instant::now();
+        let hits = engine.scan(&payload, Scope::ToolOutputOnly, "srv");
+        let elapsed = start.elapsed();
+
+        // Filtered to TEST-CAP-001 specifically, not hits.hits.len() as a
+        // whole: a run of a million "a" characters is incidentally also a
+        // valid match for locked-rules.yaml's own ENC-001
+        // ([A-Za-z0-9+/]{80,}, a base64-blob detector) — a real, separate
+        // rule genuinely firing on this payload, not a leak of this test's
+        // own reduction. Found by running this test, not assumed away.
+        let cap_hits: Vec<_> = hits.hits.iter().filter(|h| h.rule_id == "TEST-CAP-001").collect();
+        assert_eq!(
+            cap_hits.len(),
+            1,
+            "TEST-CAP-001 must still collapse to exactly one HitDetail regardless of \
+             occurrence count, got {} (all hits: [{}])",
+            cap_hits.len(),
+            hits.rule_ids().join(", ")
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "scanning a pathological payload took {:?} — MAX_OCCURRENCES_PER_RULE does not \
+             appear to be bounding per-occurrence work",
+            elapsed
+        );
+    }
+
+    /// F2's literal-path reduction: a literal, `severity: high`, `action:
+    /// elevate` rule whose pattern appears three times must still collapse
+    /// to exactly one `HitDetail`. Before this fix, the literal
+    /// (Aho-Corasick) path already used `find_iter` and called `push_hit`
+    /// once PER MATCH with no reduction at all — masked in production only
+    /// because every literal rule in `locked-rules.yaml` today is
+    /// `poison`-tier, where a single hit already short-circuits
+    /// `state_from_rule_hits` before count ever matters. This is the test
+    /// that would actually fail today if the F2 reduction had been
+    /// implemented only on the regex branch and the literal branch left
+    /// as-is — matching this file's existing convention
+    /// (`exempt_if_contains_drops_matching_hit_entirely`,
+    /// `escalate_if_entropy_gt_escalates_high_entropy_and_spares_low_entropy`
+    /// above) of injecting a custom rule via `user-rules.yaml` and scanning
+    /// through the real `RuleEngine::load` -> `scan()` path, not a
+    /// below-the-engine unit test.
+    #[test]
+    fn literal_rule_matching_three_times_still_produces_exactly_one_hit() {
+        let dir = std::env::temp_dir().join(format!("magus-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("user-rules.yaml");
+        std::fs::write(
+            &path,
+            "rules:\n  - id: TEST-LITERAL-3X-001\n    category: test\n    severity: high\n    match: { type: literal, pattern: \"suspicious-marker\" }\n    action: elevate\n",
+        )
+        .unwrap();
+        let engine = RuleEngine::load(Some(&path)).expect("valid user-rules.yaml must load");
+
+        let content = "first suspicious-marker here, second suspicious-marker there, \
+                        third suspicious-marker over here too";
+        let hits = engine.scan(content, Scope::ToolOutputOnly, "srv");
+
+        assert_eq!(
+            hits.hits.len(),
+            1,
+            "a literal rule matching 3 times must still collapse to exactly one \
+             HitDetail, got: {:?}",
+            hits.rule_ids()
+        );
+        assert_eq!(hits.hits[0].action, Action::Elevate);
     }
 
     /// Applies the exempt_if_contains + escalate_if pattern (already proven

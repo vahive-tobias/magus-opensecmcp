@@ -220,3 +220,103 @@ fn secret_gh_001_escalates_on_structurally_real_high_entropy_token() {
         hits.rule_ids().join(", ")
     );
 }
+
+/// Formalizes the external adversarial review's F2 proof-of-concept
+/// (`poc_real_secret_after_exempted_placeholder_is_never_detected`, see
+/// `docs/specs/Adversarial Review magus-opensecmcp.md` and
+/// `docs/specs/spec-f2-multi-occurrence-scan.md`) rather than writing a new
+/// scenario from scratch: AWS's own documented placeholder
+/// (`AKIAIOSFODNN7EXAMPLE`, exempted via `exempt_if_contains`) appears
+/// FIRST in the response, followed by a real-shaped, high-entropy key —
+/// the exact ordering that made `re.find()`'s single-match behavior a
+/// bypass, since the exemption check consumed the only scan attempt and
+/// the real key after it was never evaluated at all. With the F2 fix
+/// (`find_iter().take(MAX_OCCURRENCES_PER_RULE)`, keeping the strongest
+/// qualifying occurrence per rule), the exempted occurrence is dropped and
+/// the real occurrence is still found and still escalates.
+///
+/// The real key is built from non-contiguous fragments, matching
+/// `secret_aws_001_escalates_on_structurally_real_high_entropy_key` above,
+/// so no committed span of source text here is itself a contiguous
+/// AKIA-shaped match.
+#[test]
+fn secret_aws_001_finds_real_key_occurring_after_an_exempted_placeholder() {
+    let engine = RuleEngine::load(None).expect("locked-rules.yaml must load standalone");
+
+    let real_prefix = "AKIA";
+    let real_suffix = "4XJZQPMR7VNTK2LH";
+    let real_key = format!("{real_prefix}{real_suffix}");
+    let content = format!(
+        "# Configuring AWS credentials\n\
+         Use the well-known placeholder pair from AWS's own docs as a format example:\n\
+         AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\n\n\
+         The actual key committed to this deploy script by mistake was:\n\
+         AWS_ACCESS_KEY_ID={real_key}\n"
+    );
+
+    let normalized = normalize_for_matching(&content);
+    let hits = engine.scan(&normalized, Scope::ToolOutputOnly, "fp-corpus-test");
+
+    assert_eq!(
+        hits.hits.len(),
+        1,
+        "expected exactly one SECRET-AWS-001 hit (the exempted placeholder occurrence \
+         must be dropped, the real key occurrence must remain), got: [{}]",
+        hits.rule_ids().join(", ")
+    );
+
+    let state = state_from_rule_hits(&hits, ProvenanceState::Clean);
+    assert!(
+        state >= ProvenanceState::Elevated,
+        "THE F2 REGRESSION: a real, high-entropy AWS key occurring AFTER an exempted \
+         documented placeholder in the same response must still be found and escalate — \
+         under the pre-fix single-match scan, the exemption on the first (placeholder) \
+         match would have consumed the only scan attempt and the real key would never \
+         have been evaluated at all. Stayed at {:?} (rule hit(s): [{}])",
+        state,
+        hits.rule_ids().join(", ")
+    );
+}
+
+/// The same rule matching 3+ times, all real occurrences, no exemption
+/// involved — must still contribute exactly ONE HitDetail, locking in the
+/// deliberate one-representative-per-rule collapse (see the invariant on
+/// `HitDetail` in rules_engine.rs) so a future edit can't silently regress
+/// to per-occurrence counting without a test catching it. Uses SECRET-PEM-001
+/// (a fixed literal-ish banner, not entropy-dependent) with three separate
+/// PEM headers in one response, checked against `medium_or_above_count()`
+/// directly rather than just the resulting provenance state, since
+/// `SECRET-PEM-001` is already `elevate`-tier and would reach `Elevated`
+/// even if this collapse were broken.
+#[test]
+fn three_occurrences_of_same_regex_rule_still_produce_exactly_one_hit() {
+    let engine = RuleEngine::load(None).expect("locked-rules.yaml must load standalone");
+
+    let content = "\
+        -----BEGIN RSA PRIVATE KEY-----\n\
+        (redacted key material A)\n\
+        -----BEGIN RSA PRIVATE KEY-----\n\
+        (redacted key material B)\n\
+        -----BEGIN RSA PRIVATE KEY-----\n\
+        (redacted key material C)\n";
+
+    let normalized = normalize_for_matching(content);
+    let hits = engine.scan(&normalized, Scope::ToolOutputOnly, "fp-corpus-test");
+
+    let pem_hits: Vec<_> = hits.hits.iter().filter(|h| h.rule_id == "SECRET-PEM-001").collect();
+    assert_eq!(
+        pem_hits.len(),
+        1,
+        "three occurrences of the same rule's pattern must collapse to exactly one \
+         HitDetail, got {} (all hits: [{}])",
+        pem_hits.len(),
+        hits.rule_ids().join(", ")
+    );
+    assert_eq!(
+        hits.medium_or_above_count(),
+        1,
+        "three real occurrences of one rule must contribute exactly 1 to \
+         medium_or_above_count(), not 3 — occurrence count must not leak into the \
+         corroboration math"
+    );
+}

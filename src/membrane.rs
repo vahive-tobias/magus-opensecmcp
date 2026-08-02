@@ -36,16 +36,6 @@ pub struct Proposal {
     pub tool_name: String,
     #[serde(default)]
     pub bootstrap: bool,
-    /// The real size (bytes) of this call's actual arguments - what the agent
-    /// is genuinely sending outbound this turn. Previously this was faked as
-    /// a near-constant `proposal.id.len() + 256` (~290 bytes, dominated by a
-    /// fixed-length UUID), which was almost always LARGER than the decay
-    /// threshold computed from a typical tool response - meaning any
-    /// elevation decayed back to Clean on the very next call, regardless of
-    /// what that call actually was. A real, variable measure of outbound
-    /// content is required for the decay model to mean anything at all.
-    #[serde(default)]
-    pub egress_bytes: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -256,7 +246,15 @@ impl Membrane {
         self.agent_accumulators.insert(connection_id, new_agent_bp);
         self.executed_proposals.insert(proposal.id.clone());
 
-        tracker.record_outbound_and_decay(proposal.egress_bytes.max(1));
+        // Decay no longer happens here — see
+        // docs/specs/spec-f1-clean-call-decay.md. It used to be driven by
+        // this proposal's own (agent-controlled, pre-response)
+        // `egress_bytes`, which was the actual F1 "decay bombing" bug: a
+        // free, computational bypass keyed on a value the agent fabricates
+        // before the corresponding response is even known. Decay is now
+        // `AgentProvenanceTracker::record_response_outcome`, called from
+        // main.rs post-response, keyed on THIS call's own verified
+        // response classification — independent of `evaluate()` entirely.
 
         let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         let triggered_rule_ids = std::mem::take(&mut tracker.last_triggering_rule_ids);
@@ -352,7 +350,6 @@ mod tests {
             mcp_server_id: "server-a".to_string(),
             tool_name: "tool-a".to_string(),
             bootstrap: false,
-            egress_bytes: 100,
         }
     }
 
@@ -529,24 +526,25 @@ mod tests {
         );
     }
 
+    /// Renamed from `..._and_actually_triggers_decay`: per
+    /// docs/specs/spec-f1-clean-call-decay.md, decay moved entirely out of
+    /// `Membrane::evaluate` into
+    /// `AgentProvenanceTracker::record_response_outcome`, called from
+    /// main.rs post-response — `evaluate()` no longer touches
+    /// `tracker.current_state` at all (it only reads it, via
+    /// `modulate_risk_class`), so there is nothing decay-related left for
+    /// this test to exercise through this entry point. Decay itself is
+    /// covered directly in provenance.rs's own `AgentProvenanceTracker`
+    /// tests now.
     #[test]
-    fn successful_evaluation_records_id_updates_bp_and_actually_triggers_decay() {
+    fn successful_evaluation_records_id_and_updates_bp() {
         let mut membrane = make_membrane(3, 5000);
         let connection_id = Uuid::new_v4();
         membrane.register_agent(connection_id).unwrap();
         let mut tracker = AgentProvenanceTracker::new();
         let audit = AuditLogger::new_with_path(temp_audit_path(), "test-session");
 
-        // Put the tracker into Elevated with a small decay_threshold so
-        // this call's egress_bytes is guaranteed to cross it - proving
-        // record_outbound_and_decay was actually invoked (a real tracker
-        // state change), not just that evaluate() returned Ok.
-        tracker.ingest_signature(ProvenanceState::Elevated, 1, "server-a", &[]);
-        let threshold = tracker.decay_threshold;
-        assert_eq!(tracker.current_state, ProvenanceState::Elevated);
-
-        let mut proposal = make_proposal("prop-1", RiskClass::Low, AuthoritySource::User, false);
-        proposal.egress_bytes = threshold + 100;
+        let proposal = make_proposal("prop-1", RiskClass::Low, AuthoritySource::User, false);
 
         let result = membrane.evaluate(&proposal, connection_id, &mut tracker, &audit);
         assert!(result.is_ok());
@@ -557,11 +555,6 @@ mod tests {
         assert_eq!(
             *membrane.agent_accumulators.get(&connection_id).unwrap(),
             SESSION_INIT_BP + 200, // Low risk class base BP
-        );
-        assert_eq!(
-            tracker.current_state,
-            ProvenanceState::Clean,
-            "decay must actually have moved Elevated -> Clean given egress past threshold, not merely left evaluate() returning Ok"
         );
     }
 
@@ -605,7 +598,7 @@ mod tests {
         // with InboundPoisoningDetected, and record_rejection logs
         // tracker.last_triggering_rule_ids as-is.
         let mut poisoned_tracker = AgentProvenanceTracker::new();
-        poisoned_tracker.ingest_signature(ProvenanceState::Poisoned, 10, "server-a", &["MCT-001".to_string()]);
+        poisoned_tracker.ingest_signature(ProvenanceState::Poisoned, "server-a", &["MCT-001".to_string()]);
         let rejected = make_proposal("prop-rejected", RiskClass::Low, AuthoritySource::User, false);
         assert_eq!(
             membrane.evaluate(&rejected, connection_id, &mut poisoned_tracker, &audit),

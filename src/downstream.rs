@@ -88,15 +88,17 @@ impl DownstreamConnection {
     }
 
     /// Forwards an approved tools/call to the real server and returns the raw
-    /// JSON result plus its serialized byte length (for provenance ingress
-    /// accounting — the actual bytes that would enter the agent's context).
-    pub async fn call_tool(&mut self, name: &str, arguments: Value) -> Result<(Value, usize)> {
-        let result = self.request("tools/call", json!({
+    /// JSON result. Used to also return a serialized byte count alongside it
+    /// for provenance ingress accounting (decay's old `egress_bytes`
+    /// mechanism) — removed per docs/specs/spec-f1-clean-call-decay.md: that
+    /// count was redundant with the separate serialization main.rs already
+    /// performs for `classify_response`, and its only reader was the
+    /// byte-threshold decay mechanism this fix replaced entirely.
+    pub async fn call_tool(&mut self, name: &str, arguments: Value) -> Result<Value> {
+        self.request("tools/call", json!({
             "name": name,
             "arguments": arguments,
-        })).await?;
-        let bytes = serde_json::to_vec(&result).unwrap_or_default().len();
-        Ok((result, bytes))
+        })).await
     }
 
     async fn request(&mut self, method: &str, params: Value) -> Result<Value> {

@@ -459,7 +459,6 @@ async fn handle_tools_call(
     let server_grade = registry.server_config(&mcp_server_id)
         .map(|c| c.source_grade)
         .unwrap_or_default();
-    let egress_bytes = serde_json::to_vec(&arguments).map(|b| b.len()).unwrap_or(0);
     let mut tracker = provenance_tracker.lock().await;
     let proposal = Proposal {
         id: Uuid::new_v4().to_string(),
@@ -477,7 +476,6 @@ async fn handle_tools_call(
         mcp_server_id: mcp_server_id.clone(),
         tool_name: tool_name.to_string(),
         bootstrap: entry.bootstrap,
-        egress_bytes,
     };
 
     let mut mem = membrane.lock().await;
@@ -496,7 +494,7 @@ async fn handle_tools_call(
             drop(conn);
 
             match call_result {
-                Ok((mut real_result, ingress_bytes)) => {
+                Ok(mut real_result) => {
                     let raw_bytes = serde_json::to_vec(&real_result).unwrap_or_default();
                     let (form, _sc, long_sc, total_bytes, combined_text) = provenance::classify_response(&raw_bytes);
                     // No downstream-declared output schema means this stays
@@ -546,7 +544,41 @@ async fn handle_tools_call(
                     // reading that existing semantics, not adding a second,
                     // separate noise-suppression mechanism on top of it.
                     let state_before = tracker.current_state;
-                    tracker.ingest_signature(new_state, ingress_bytes, &mcp_server_id, &hit_summary.rule_ids());
+
+                    // record_response_outcome BEFORE ingest_signature —
+                    // verified to matter for one specific transition, not
+                    // merely a readability preference (see
+                    // docs/specs/spec-f1-clean-call-decay.md; the spec's own
+                    // "the order is provably arbitrary" framing did not
+                    // survive a direct trace and is corrected here rather
+                    // than copied — see this fix's report). Both functions
+                    // are projections of the same `new_state`.
+                    // ingest_signature only mutates `current_state` on
+                    // strict escalation (`new_state > current_state`).
+                    // record_response_outcome's reset branch
+                    // (`new_state > Elevated`) never reads `current_state`
+                    // for its core action, so ordering doesn't matter
+                    // there. Its OTHER branch (`new_state <= Elevated`)
+                    // reads `current_state` to pick which tier applies —
+                    // and there is exactly one transition where
+                    // ingest_signature's mutation would change that read: a
+                    // session at `Clean` receiving `new_state == Elevated`.
+                    // `ingest_signature` escalates `Clean -> Elevated` on
+                    // that response; if `record_response_outcome` ran
+                    // AFTER that escalation, it would see
+                    // `current_state == Elevated` and incorrectly start
+                    // counting THIS SAME escalating response as the first
+                    // clean call toward decaying back out of `Elevated` —
+                    // the response that just left `Clean` shouldn't also
+                    // earn credit for returning to it. Running
+                    // `record_response_outcome` FIRST avoids this: it sees
+                    // `current_state == Clean` (no tier to decay from
+                    // `Clean`, correctly a no-op), and the escalation
+                    // happens afterward, unaffected. Every other
+                    // transition is genuinely order-independent; this one
+                    // is why the order is required, not just readable.
+                    tracker.record_response_outcome(new_state);
+                    tracker.ingest_signature(new_state, &mcp_server_id, &hit_summary.rule_ids());
 
                     // SEC-01: only inject when this specific call caused a
                     // genuine escalation, not on every subsequent call while
