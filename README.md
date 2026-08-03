@@ -358,8 +358,8 @@ longer wedge the gateway indefinitely.
   `security_policy.default_discovery_timeout_seconds` (15s). Neither
   default is a measurement — they're policy judgment calls, the same as
   this codebase's other tuning constants. Zero, negative, NaN, and
-  infinite values are all rejected at config-load time; there is no
-  "wait forever" setting.
+  infinite values are all rejected before discovery ever starts; there is
+  no "wait forever" setting.
 - A timeout rejects only that one call, with a distinct
   `DownstreamTimeout` rejection code. It does not retry — most tools
   aren't idempotent, and this project doesn't invent an
@@ -375,7 +375,10 @@ longer wedge the gateway indefinitely.
   gateway with whatever else discovered successfully — the hung server
   shows up in the `--discovery-report`/console summary's failed-servers
   section. The opt-in `security_policy.refuse_startup_on_discovery_timeout`
-  makes any discovery failure a hard startup refusal instead.
+  makes any discovery *timeout* a hard startup refusal instead. (A
+  non-timeout discovery failure — the configured command doesn't exist,
+  the server sends garbage — already halts startup unconditionally,
+  independent of this flag; it isn't part of what this flag changes.)
 - None of this — a single timeout, a degraded connection, either
   discovery outcome — ever feeds the provenance/risk-budget machinery.
   An absence isn't evidence about content, and there's no calibration
