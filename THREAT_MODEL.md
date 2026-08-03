@@ -71,6 +71,16 @@ full force. A schema violation or an unparseable payload has no
 false-positive class; there is nothing to corroborate, so it poisons
 directly.
 
+"Recoverable" has a real mechanism behind it, not an implied instant
+reset: decay back down a tier requires a run of consecutive,
+independently-verified-clean responses — not simply time passing, and not
+anything the agent or a downstream server can assert about itself. A
+downstream server that fully controls its own responses can still recover
+a session's standing by behaving for long enough, at a real, bounded cost
+in both round trips and accumulated risk budget — a deliberate design
+tradeoff (decay has to be reachable somehow, or "recoverable" would be a
+lie), not a loophole nobody noticed.
+
 ## What this defends against
 
 **Tool definition tampering ("rug-pull") between discovery and use.**
@@ -94,6 +104,23 @@ smuggling (Unicode Tag-block decode, zero-width stripping), and covert
 exfiltration channels. See `rules_engine.rs`'s module header for exactly
 which normalization steps are and aren't implemented — this list is
 deliberately incomplete and says so in the source, not just here.
+
+**Instruction smuggling via a tool's own description, not just its
+output.** A downstream server can poison the agent's context before a
+tool is ever called, by embedding an instruction in the tool's own
+description (surfaced via `tools/list`) rather than in a response. For
+`Attested`/`Known`-graded servers, forwarded descriptions are stripped of
+the same invisible-character smuggling techniques (Unicode Tag-block
+characters, zero-width fragmentation) detection already watches tool
+output for — deleted outright, not decoded and revealed, since revealing
+a smuggled instruction would make it more dangerous, not less. A
+description matching a `poison`-tier signature is withheld entirely,
+regardless of source grade; an `elevate`/`flag`-tier match is sanitized by
+default and withheld too under an opt-in
+`security_policy.strict_description_scanning`. `Unvalidated`/`Suspicious`-
+graded servers already had descriptions withheld entirely before this
+existed — this closes the gap for the grades trusted enough to have them
+forwarded at all.
 
 **Structural anomalies in tool responses.** Independent of signature
 matching: response shape, aggregate size, and (when a tool declares one)
@@ -135,6 +162,21 @@ them), compiled pattern size is also bounded (`size_limit`/
 `dfa_size_limit` in `rules_engine.rs`) against the separate, real
 compile-time resource-exhaustion class of attack (CVE-2022-24713
 precedent, not a hypothetical).
+
+**A stalled or hung downstream server wedging the gateway indefinitely.**
+Both the discovery handshake (`initialize`/`tools/list`) and every
+`tools/call` are bounded by a configurable timeout — a downstream server
+that stops responding, whether from a genuine bug or a deliberate stall,
+no longer freezes the entire session waiting for it. A timeout rejects
+only the one call in flight; a server that times out twice in a row is
+marked unavailable for the rest of the process's life rather than
+silently re-hanging on every subsequent call. Framed honestly: a timeout
+carries no information about *why* the server didn't respond — it can't
+distinguish a deliberately stalling attacker from ordinary network
+slowness, and isn't treated as evidence by the provenance state machine
+for exactly that reason. What this closes is availability, not detection:
+the gateway itself no longer becomes the single point of failure a
+stalled downstream server could otherwise turn it into.
 
 ## What this does NOT defend against, and why
 
