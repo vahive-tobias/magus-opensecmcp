@@ -7,6 +7,15 @@
 // real downstream connection. See
 // docs/specs/spec-sec03-hash-pin-enforcement.md for the full spec this
 // implements.
+//
+// `validate_policy` has grown into the general SecurityPolicy-wide sanity
+// check as later fixes landed (F3's `refuse_startup_on_tool_name_collision`,
+// now F5's two timeout defaults below) — not pin-specific anymore in
+// practice, even though the module name still is. Per-entry `tools:`/
+// `downstream_servers:` timeout overrides are validated in registry.rs's
+// `load_from_yaml` instead, not here — those live on YAML structs that
+// module already owns parsing for, while this function's job stays "is
+// SecurityPolicy internally self-consistent," the same scope it always had.
 
 use crate::registry::SecurityPolicy;
 
@@ -75,6 +84,35 @@ pub fn validate_policy(policy: &SecurityPolicy) -> Result<(), String> {
                 .to_string(),
         );
     }
+
+    // F5 (see docs/specs/Adversarial Review magus-opensecmcp.md): a zero,
+    // negative, NaN, or infinite global timeout default is refused
+    // outright, not silently clamped or treated as "no timeout" — a
+    // supported "wait forever" configuration would just resurrect the
+    // finding this field exists to close. registry.rs's own
+    // `validate_timeout_value` does the identical check for per-entry
+    // `timeout_seconds`/`discovery_timeout_seconds` overrides; duplicated
+    // here rather than shared across modules for the same reason as
+    // everywhere else in this codebase a two-line check gets repeated
+    // instead of abstracted — it's small enough that a shared helper
+    // would cost more (a cross-module dependency for a five-line
+    // function) than it saves.
+    if !policy.default_tool_timeout_seconds.is_finite() || policy.default_tool_timeout_seconds <= 0.0 {
+        return Err(format!(
+            "security_policy.default_tool_timeout_seconds must be a positive, finite number of seconds \
+             ({} is not) — a zero, negative, NaN, or infinite timeout would mean \"wait forever\" (or crash), \
+             exactly the unbounded-hang behavior this field exists to prevent.",
+            policy.default_tool_timeout_seconds
+        ));
+    }
+    if !policy.default_discovery_timeout_seconds.is_finite() || policy.default_discovery_timeout_seconds <= 0.0 {
+        return Err(format!(
+            "security_policy.default_discovery_timeout_seconds must be a positive, finite number of seconds \
+             ({} is not) — same reasoning as default_tool_timeout_seconds above.",
+            policy.default_discovery_timeout_seconds
+        ));
+    }
+
     Ok(())
 }
 
@@ -166,5 +204,48 @@ mod tests {
     #[test]
     fn strict_without_refuse_is_valid() {
         assert!(validate_policy(&policy(true, false)).is_ok());
+    }
+
+    // ---- validate_policy: F5 timeout defaults ----
+
+    #[test]
+    fn default_policy_has_sane_nonzero_timeouts_and_is_valid() {
+        // Guards the exact landmine this Default impl exists to avoid: if
+        // SecurityPolicy::default() ever regressed back to a derived
+        // (zero-valued) Default, every test in this module using
+        // ..Default::default() would start failing this same check.
+        let p = SecurityPolicy::default();
+        assert!(p.default_tool_timeout_seconds > 0.0);
+        assert!(p.default_discovery_timeout_seconds > 0.0);
+        assert!(validate_policy(&p).is_ok());
+    }
+
+    #[test]
+    fn zero_default_tool_timeout_is_a_config_error() {
+        let mut p = policy(false, false);
+        p.default_tool_timeout_seconds = 0.0;
+        assert!(validate_policy(&p).is_err());
+    }
+
+    #[test]
+    fn zero_default_discovery_timeout_is_a_config_error() {
+        let mut p = policy(false, false);
+        p.default_discovery_timeout_seconds = 0.0;
+        assert!(validate_policy(&p).is_err());
+    }
+
+    #[test]
+    fn negative_or_non_finite_default_timeout_is_a_config_error() {
+        let mut negative = policy(false, false);
+        negative.default_tool_timeout_seconds = -1.0;
+        assert!(validate_policy(&negative).is_err());
+
+        let mut nan = policy(false, false);
+        nan.default_discovery_timeout_seconds = f64::NAN;
+        assert!(validate_policy(&nan).is_err());
+
+        let mut infinite = policy(false, false);
+        infinite.default_tool_timeout_seconds = f64::INFINITY;
+        assert!(validate_policy(&infinite).is_err());
     }
 }

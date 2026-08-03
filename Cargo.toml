@@ -25,6 +25,10 @@ path = "src/bin/fake_op3_test_server.rs"
 name = "fake_desc_test_server"
 path = "src/bin/fake_desc_test_server.rs"
 
+[[bin]]
+name = "fake_hang_test_server"
+path = "src/bin/fake_hang_test_server.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }

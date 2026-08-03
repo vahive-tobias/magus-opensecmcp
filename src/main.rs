@@ -7,13 +7,14 @@ use magus_opensecmcp::schema_check;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use magus_opensecmcp::advisory;
 use magus_opensecmcp::audit::AuditLogger;
-use magus_opensecmcp::downstream::DownstreamConnection;
+use magus_opensecmcp::downstream::{DownstreamConnection, DownstreamError};
 use magus_opensecmcp::hasher::{compute_definition_hash, hash_to_hex, McpToolDefinition};
 use magus_opensecmcp::membrane::{Membrane, Proposal};
 use magus_opensecmcp::pin_policy::{self, PinStatus};
@@ -39,6 +40,48 @@ struct PinMismatch {
     tool_name: String,
     expected: String,
     actual: String,
+}
+
+/// F5 (see `docs/specs/Adversarial Review magus-opensecmcp.md`): a server
+/// that never completed discovery at all — currently only reached via a
+/// discovery-time timeout (`spawn_and_initialize`/`list_tools` exceeding
+/// `discovery_timeout_seconds`), never via other spawn/handshake failures,
+/// which keep failing the whole gateway startup exactly as before this
+/// fix (see the phase-1 loop below for why that split is deliberate, not
+/// partial). A fourth observability tier alongside `discovered`/
+/// `discovered_with_issues`/`discovered_quarantined` — those three all
+/// classify a TOOL; this classifies a SERVER that produced no tool list
+/// to classify tools from at all.
+struct FailedServer {
+    server_id: String,
+    reason: String,
+}
+
+/// Shared by both discovery-time timeout sites (`initialize`, `tools/list`)
+/// in the phase-1 loop below — one place that logs, audits, and records
+/// the failure, so the two call sites can't drift into slightly different
+/// wording or an inconsistent audit event shape.
+fn record_discovery_timeout(
+    audit_logger: &AuditLogger,
+    failed_servers: &mut Vec<FailedServer>,
+    server_id: &str,
+    phase: &str,
+    elapsed: std::time::Duration,
+    limit: std::time::Duration,
+) {
+    let reason = format!("{} timed out after {:.1}s (limit {:.1}s)", phase, elapsed.as_secs_f64(), limit.as_secs_f64());
+    eprintln!(
+        "[MAGUS] WARNING: downstream '{}' {} Excluding this server from discovery; other servers continue.",
+        server_id, reason
+    );
+    audit_logger.log_event("downstream_timeout", serde_json::Map::from_iter([
+        ("server_id".to_string(), serde_json::json!(server_id)),
+        ("tool_name".to_string(), serde_json::Value::Null),
+        ("phase".to_string(), serde_json::json!(phase)),
+        ("elapsed_seconds".to_string(), serde_json::json!(elapsed.as_secs_f64())),
+        ("limit_seconds".to_string(), serde_json::json!(limit.as_secs_f64())),
+    ]));
+    failed_servers.push(FailedServer { server_id: server_id.to_string(), reason });
 }
 
 /// Outcome of the tool-description rule scan at discovery time, cached for
@@ -289,14 +332,61 @@ async fn main() -> Result<()> {
     // sanitize_description, not discarded after discovery the way it used
     // to be. Already correctly composite-keyed; F3 doesn't touch this.
     let mut description_hits: HashMap<(String, String), DescriptionHitOutcome> = HashMap::new();
+    // F5: servers that never completed discovery at all — see
+    // FailedServer's doc comment. Populated only by a discovery-time
+    // timeout; every other spawn/handshake failure still propagates via
+    // `?` and aborts the whole gateway exactly as before this fix (see
+    // the two `DownstreamError::Other` arms below) — that behavior isn't
+    // part of what F5 asked to change, and conflating "server timed out"
+    // with "server's command doesn't exist"/"server sent garbage" would
+    // blur two genuinely different failure classes into one fail-soft
+    // path without that having been the actual finding.
+    let mut failed_servers: Vec<FailedServer> = Vec::new();
 
     for server_cfg in &registry.servers {
+        let discovery_timeout = Duration::from_secs_f64(
+            server_cfg.discovery_timeout_seconds.unwrap_or(registry.security_policy.default_discovery_timeout_seconds),
+        );
         eprintln!("[MAGUS] Spawning downstream '{}': {} {:?}", server_cfg.server_id, server_cfg.command, server_cfg.args);
-        let mut conn = DownstreamConnection::spawn_and_initialize(server_cfg).await
-            .with_context(|| format!("failed to bring up downstream server '{}'", server_cfg.server_id))?;
+        let mut conn = match DownstreamConnection::spawn_and_initialize(server_cfg, discovery_timeout).await {
+            Ok(c) => c,
+            Err(DownstreamError::Timeout { elapsed, limit }) => {
+                record_discovery_timeout(&audit_logger, &mut failed_servers, &server_cfg.server_id, "initialize", elapsed, limit);
+                continue;
+            }
+            Err(DownstreamError::Other(e)) => {
+                return Err(e.context(format!("failed to bring up downstream server '{}'", server_cfg.server_id)));
+            }
+            Err(DownstreamError::Degraded) => {
+                // Unreachable in practice (a freshly spawned connection is
+                // never degraded), but DownstreamError is one shared type
+                // across discovery and runtime — matched explicitly rather
+                // than assumed away, so this stays a clean, traceable
+                // error instead of a panic if that assumption is ever
+                // wrong later.
+                return Err(anyhow::anyhow!(
+                    "unexpected: a freshly spawned connection for '{}' reported itself degraded",
+                    server_cfg.server_id
+                ));
+            }
+        };
 
-        let tools = conn.list_tools().await
-            .with_context(|| format!("tools/list failed against '{}'", server_cfg.server_id))?;
+        let tools = match conn.list_tools(discovery_timeout).await {
+            Ok(t) => t,
+            Err(DownstreamError::Timeout { elapsed, limit }) => {
+                record_discovery_timeout(&audit_logger, &mut failed_servers, &server_cfg.server_id, "tools/list", elapsed, limit);
+                continue;
+            }
+            Err(DownstreamError::Other(e)) => {
+                return Err(e.context(format!("tools/list failed against '{}'", server_cfg.server_id)));
+            }
+            Err(DownstreamError::Degraded) => {
+                return Err(anyhow::anyhow!(
+                    "unexpected: connection for '{}' reported itself degraded during discovery",
+                    server_cfg.server_id
+                ));
+            }
+        };
         eprintln!("[MAGUS] '{}' advertises {} real tool(s).", server_cfg.server_id, tools.len());
 
         for t in &tools {
@@ -421,6 +511,24 @@ async fn main() -> Result<()> {
             source_grade: server_cfg.source_grade,
             tools,
         });
+    }
+
+    // ---- F5: decide what to do with the complete failed-discovery
+    //      picture, now that every server has been attempted. Checked
+    //      FIRST, ahead of the pin-mismatch decision below — a server
+    //      that never completed discovery contributed zero mismatches to
+    //      judge in the first place, so this is just the earliest point
+    //      in the pipeline where "did discovery even finish for every
+    //      configured server" is knowable at all.
+    if registry.security_policy.refuse_startup_on_discovery_timeout && !failed_servers.is_empty() {
+        eprintln!(
+            "[MAGUS] FATAL: refuse_startup_on_discovery_timeout is set and {} server(s) failed to complete discovery:",
+            failed_servers.len()
+        );
+        for f in &failed_servers {
+            eprintln!("[MAGUS]   '{}': {}", f.server_id, f.reason);
+        }
+        std::process::exit(5);
     }
 
     // ---- Decide what to do with the complete pin-mismatch picture, now
@@ -612,10 +720,12 @@ async fn main() -> Result<()> {
     let tool_count: usize = discovered.iter().map(|d| d.tools.len()).sum();
     audit_logger.log_event(
         "discovery_summary",
-        discovery_summary_audit_fields(tool_count, discovered_quarantined.len(), discovered_with_issues.len()),
+        discovery_summary_audit_fields(
+            tool_count, discovered_quarantined.len(), discovered_with_issues.len(), failed_servers.len(),
+        ),
     );
 
-    let summary = discovery_summary(tool_count, &discovered_quarantined, &discovered_with_issues);
+    let summary = discovery_summary(tool_count, &discovered_quarantined, &discovered_with_issues, &failed_servers);
     // The final tally, printed IN ADDITION to the per-finding warnings
     // already printed in real time above as each was discovered — this
     // doesn't replace those, it's the summary on top of them. Only the
@@ -717,11 +827,16 @@ async fn main() -> Result<()> {
 /// load-bearing (no test asserts on it byte-for-byte); the SHAPE is:
 /// final tally line, then one section per non-empty exclusion tier, each
 /// with a per-item line and a remediation hint.
-fn discovery_summary(available_count: usize, quarantined: &[ToolExclusion], with_issues: &[ToolExclusion]) -> String {
+fn discovery_summary(
+    available_count: usize,
+    quarantined: &[ToolExclusion],
+    with_issues: &[ToolExclusion],
+    failed_servers: &[FailedServer],
+) -> String {
     let excluded_count = quarantined.len() + with_issues.len();
     let mut out = format!(
-        "Discovery complete: {} tool(s) available to the agent, {} excluded.\n",
-        available_count, excluded_count
+        "Discovery complete: {} tool(s) available to the agent, {} excluded, {} server(s) failed to complete discovery.\n",
+        available_count, excluded_count, failed_servers.len()
     );
 
     if !with_issues.is_empty() {
@@ -753,6 +868,21 @@ fn discovery_summary(available_count: usize, quarantined: &[ToolExclusion], with
         );
     }
 
+    if !failed_servers.is_empty() {
+        out.push_str(&format!(
+            "\nFAILED TO DISCOVER ({}) — server did not complete discovery, no tools available from it:\n",
+            failed_servers.len()
+        ));
+        for f in failed_servers {
+            out.push_str(&format!("  {}   ({})\n", f.server_id, f.reason));
+        }
+        out.push_str(
+            "  To fix: check the server's own logs (passed through to this process's stderr);\n\
+             \x20\x20increase discovery_timeout_seconds for it in config.yaml if it's just slow to\n\
+             \x20\x20start, or fix/restart it if it's genuinely wedged.\n",
+        );
+    }
+
     out.trim_end().to_string()
 }
 
@@ -768,11 +898,13 @@ fn discovery_summary_audit_fields(
     available_count: usize,
     quarantined_count: usize,
     name_collision_count: usize,
+    failed_server_count: usize,
 ) -> serde_json::Map<String, serde_json::Value> {
     serde_json::Map::from_iter([
         ("available_count".to_string(), serde_json::json!(available_count)),
         ("quarantined_count".to_string(), serde_json::json!(quarantined_count)),
         ("name_collision_count".to_string(), serde_json::json!(name_collision_count)),
+        ("failed_server_count".to_string(), serde_json::json!(failed_server_count)),
     ])
 }
 
@@ -823,10 +955,11 @@ mod tests {
 
     #[test]
     fn discovery_summary_with_no_exclusions_has_no_tier_sections() {
-        let summary = discovery_summary(5, &[], &[]);
+        let summary = discovery_summary(5, &[], &[], &[]);
         assert!(summary.contains("5 tool(s) available to the agent, 0 excluded"));
         assert!(!summary.contains("QUARANTINED"));
         assert!(!summary.contains("DISCOVERED WITH ISSUES"));
+        assert!(!summary.contains("FAILED TO DISCOVER"));
     }
 
     #[test]
@@ -836,7 +969,7 @@ mod tests {
             exclusion("srv-b", "search", ExclusionStage::NameCollision, "also registered by server(s): srv-c"),
             exclusion("srv-c", "search", ExclusionStage::NameCollision, "also registered by server(s): srv-b"),
         ];
-        let summary = discovery_summary(3, &quarantined, &with_issues);
+        let summary = discovery_summary(3, &quarantined, &with_issues, &[]);
 
         assert!(summary.contains("3 tool(s) available to the agent, 3 excluded"));
         assert!(summary.contains("QUARANTINED (1)"));
@@ -846,14 +979,31 @@ mod tests {
         assert!(summary.contains("srv-c/search"));
     }
 
+    // ---- discovery_summary: F5 failed-servers tier ----
+
+    #[test]
+    fn discovery_summary_includes_failed_servers_section() {
+        let failed = vec![FailedServer {
+            server_id: "srv-hung".to_string(),
+            reason: "initialize timed out after 15.0s (limit 15.0s)".to_string(),
+        }];
+        let summary = discovery_summary(4, &[], &[], &failed);
+
+        assert!(summary.contains("4 tool(s) available to the agent, 0 excluded, 1 server(s) failed to complete discovery"));
+        assert!(summary.contains("FAILED TO DISCOVER (1)"));
+        assert!(summary.contains("srv-hung"));
+        assert!(summary.contains("initialize timed out"));
+    }
+
     // ---- discovery_summary_audit_fields ----
 
     #[test]
     fn discovery_summary_audit_fields_has_the_expected_shape() {
-        let fields = discovery_summary_audit_fields(11, 1, 2);
+        let fields = discovery_summary_audit_fields(11, 1, 2, 3);
         assert_eq!(fields.get("available_count"), Some(&serde_json::json!(11)));
         assert_eq!(fields.get("quarantined_count"), Some(&serde_json::json!(1)));
         assert_eq!(fields.get("name_collision_count"), Some(&serde_json::json!(2)));
+        assert_eq!(fields.get("failed_server_count"), Some(&serde_json::json!(3)));
     }
 }
 
@@ -1092,12 +1242,29 @@ async fn handle_tools_call(
     match eval_result {
         Ok(()) => {
             // GOVERNANCE APPROVED. Forward to the REAL downstream server.
+            //
+            // F5 (see docs/specs/Adversarial Review magus-opensecmcp.md):
+            // note where this sits relative to `mem.evaluate` above —
+            // governance has ALREADY run and its BP/provenance-state
+            // effects have ALREADY landed by the time this call is even
+            // attempted, exactly as for any other downstream outcome
+            // (success, ExecutionFailed). A timeout or a degraded-refusal
+            // below adds NOTHING further to provenance/Membrane — neither
+            // `record_response_outcome` nor `ingest_signature` nor the
+            // SEC-01 advisory injection are reachable outside the `Ok`
+            // arm's success path. That's the hard boundary the finding
+            // requires (a timeout is an absence, not evidence about
+            // content, and has no calibration basis the way a rule hit
+            // does) — satisfied structurally here, not by a special case.
             let conn_arc = match connections.get(&mcp_server_id) {
                 Some(c) => c.clone(),
                 None => return jsonrpc_error(id, -32002, "Downstream connection missing", None),
             };
+            let call_timeout = Duration::from_secs_f64(
+                entry.timeout_seconds.unwrap_or(registry.security_policy.default_tool_timeout_seconds),
+            );
             let mut conn = conn_arc.lock().await;
-            let call_result = conn.call_tool(tool_name, arguments).await;
+            let call_result = conn.call_tool(tool_name, arguments, call_timeout).await;
             drop(conn);
 
             match call_result {
@@ -1200,7 +1367,39 @@ async fn handle_tools_call(
 
                     serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": real_result })
                 }
-                Err(e) => {
+                // F5: DownstreamTimeout/DownstreamConnectionDegraded are
+                // new, distinct rejection codes — matching the existing
+                // ToolQuarantinedPinMismatch/ToolExcludedNameCollision
+                // pattern rather than folding either into the pre-existing
+                // generic ExecutionFailed, which stays exactly as it was
+                // for every OTHER downstream failure (process exited,
+                // malformed response, ...).
+                Err(DownstreamError::Timeout { elapsed, limit }) => {
+                    eprintln!(
+                        "[MAGUS] Downstream call to '{}'/{} timed out after {:.1}s (limit {:.1}s).",
+                        mcp_server_id, tool_name, elapsed.as_secs_f64(), limit.as_secs_f64()
+                    );
+                    audit_logger.log_event("downstream_timeout", serde_json::Map::from_iter([
+                        ("server_id".to_string(), serde_json::json!(mcp_server_id)),
+                        ("tool_name".to_string(), serde_json::json!(tool_name)),
+                        ("phase".to_string(), serde_json::json!("runtime")),
+                        ("elapsed_seconds".to_string(), serde_json::json!(elapsed.as_secs_f64())),
+                        ("limit_seconds".to_string(), serde_json::json!(limit.as_secs_f64())),
+                    ]));
+                    jsonrpc_error(id, -32002, "Downstream call timed out", Some("DownstreamTimeout"))
+                }
+                Err(DownstreamError::Degraded) => {
+                    eprintln!(
+                        "[MAGUS] Downstream call to '{}'/{} rejected: connection degraded after repeated timeouts.",
+                        mcp_server_id, tool_name
+                    );
+                    jsonrpc_error(
+                        id, -32002,
+                        "Downstream connection degraded after repeated timeouts; a gateway restart is required",
+                        Some("DownstreamConnectionDegraded"),
+                    )
+                }
+                Err(DownstreamError::Other(e)) => {
                     eprintln!("[MAGUS] Downstream call failed: {}", e);
                     jsonrpc_error(id, -32002, "Tool execution failed", Some("ExecutionFailed"))
                 }
