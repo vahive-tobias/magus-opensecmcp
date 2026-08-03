@@ -57,7 +57,7 @@ package, not simulated:
   to produce identical flag-only output; they don't anymore.
 - The provenance state machine and risk-evaluation engine (`provenance.rs`,
   `membrane.rs`) — the oldest and most security-critical code in this
-  repo — now have direct unit test coverage (45 tests) instead of only
+  repo — now have direct unit test coverage (56 tests) instead of only
   ever having been checked by hand. Covers the full source-grade/
   response-shape classification table, the rule-hit corroboration logic
   (a second heuristic signal while already `Contaminated` escalates to
@@ -98,13 +98,49 @@ package, not simulated:
   calling internal functions) — added specifically because Homebrew's
   formula test needs `--version` to work, but useful regardless of how
   you installed it.
+- Provenance decay now requires a verified-clean round trip, not the size
+  of the agent's own outbound request, to heal a session's state back
+  down. The earlier byte-based version let one padded, otherwise-unrelated
+  call decay `Contaminated` back to `Elevated` for free, indefinitely —
+  closing it meant moving the decay check from pre-response to
+  post-response, keyed on the call's own verified outcome rather than
+  anything the agent claims about itself.
+- Rule scanning now evaluates every occurrence of a pattern in a response,
+  not just the first. The earlier first-match-only scan meant a real
+  secret appearing after a known-benign placeholder (the exact case
+  `exempt_if_contains` exists to handle) was never evaluated at all, since
+  the placeholder match consumed the scanner's only attempt. Multiple
+  occurrences of the same rule still collapse to one signal for
+  corroboration purposes — that's deliberate, not a regression.
+- Configuring more than one downstream server no longer risks a silent
+  bare-name collision. Tool names are resolved through an explicit
+  three-phase discovery pipeline (discover, quarantine, resolve) that
+  excludes every tool sharing an ambiguous name across servers, rather
+  than letting whichever server was processed last in config order
+  silently win. A `--discovery-report` flag shows the full picture —
+  what's available to the agent, what's quarantined, what's excluded, and
+  why — without wiring up a client first.
+- A tool description from a trusted (`Attested`/`Known`-graded) server is
+  now actually sanitized before being forwarded to the agent, not just
+  scanned for a console warning that never touched what the agent
+  received. Smuggling attempts — invisible Unicode characters used to
+  hide instructions in plain sight — are stripped outright, not decoded
+  and revealed.
+- Downstream tool calls and the discovery handshake are both bounded by a
+  configurable timeout now, so a stalled or hung downstream server no
+  longer wedges the gateway indefinitely. A timeout rejects only that one
+  call; a server that times out twice in a row is marked unavailable for
+  the rest of the session (a restart clears it) rather than silently
+  re-hanging on every subsequent call.
 
-What isn't done yet: dynamic (learned) server trust grading, more than one
-downstream server at a time in the demo config, a packaged binary release,
-and the fuller normalization pipeline (NFKC/confusables skeletonization,
-base64-peel-and-rescan) that `rules_engine.rs` deliberately stops short of
-for now — see that file's module comment for exactly what's in v1 versus
-noted as follow-up. See [Roadmap](#roadmap).
+What isn't done yet: dynamic (learned) server trust grading, a packaged
+binary release, and the fuller normalization pipeline (NFKC/confusables
+skeletonization, base64-peel-and-rescan) that `rules_engine.rs`
+deliberately stops short of for now — see that file's module comment for
+exactly what's in v1 versus noted as follow-up. Multi-server tool
+resolution itself is built and tested (see above); the shipped
+`config.yaml` demo still only configures one server — see
+[Roadmap](#roadmap).
 
 ## Installation & Quickstart
 
@@ -123,8 +159,11 @@ formula's own `rust` dependency.
 Requires Rust and Node (the demo downstream server is `npx`-launched).
 On Windows, if the gateway fails to spawn the demo server, change
 `command: "npx"` to `command: "npx.cmd"` in `config.yaml` — `npx` alone
-resolves differently there. This whole project has been built and tested
-on Windows this session, so this isn't a hypothetical edge case.
+resolves differently there. This is a real, hands-on-verified fix, not a
+guess — but it's a point-in-time check, not an ongoing guarantee: CI
+(the badge above) currently runs `ubuntu-latest`/`macos-latest` only, so
+the Windows path isn't re-verified automatically on every change the way
+the other two platforms are.
 
 ```bash
 git clone https://github.com/vahive-tobias/magus-opensecmcp.git
@@ -209,12 +248,29 @@ happen as a side effect of an unrelated dependency bump.
                                           |                     structuredContent against its declared
                                           |                     outputSchema, when one exists
                                           |-- downstream.rs    : the actual MCP client half - spawns and
-                                          |                     talks to the real server
+                                          |                     talks to the real server, discovery and
+                                          |                     tools/call both bounded by a configurable
+                                          |                     timeout; two consecutive timeouts on one
+                                          |                     server mark that connection degraded for the
+                                          |                     rest of the session (fails fast, no
+                                          |                     auto-retry — see "Downstream timeouts" below)
                                           |-- audit.rs         : local JSONL log, ~/.magus/audit.jsonl,
                                           |                     never leaves the machine, now includes which
                                           |                     rule id(s) caused a state escalation
                                           |-- quota.rs         : local, in-memory, calendar-reset counter
 ```
+
+Before any of this serves the agent, startup itself runs as an explicit
+three-phase discovery pipeline: **discover** every tool from every
+configured server, **quarantine** any tool whose hash-pin doesn't match
+(before collision detection runs, deliberately — a tool already excluded
+for a pin mismatch shouldn't also register as an ambiguous collision for
+an unrelated reason), then **resolve** bare tool names, excluding every
+tool whose name is still claimed by more than one surviving server once
+quarantine has run. Only names left with exactly one claimant become
+callable. Run `magus-gateway config.yaml --discovery-report` to see the
+full breakdown — available, quarantined, excluded, or failed to
+discover — without wiring up a client first.
 
 Each state in that chain carries exactly one meaning as of this writing — see `THREAT_MODEL.md` for what `Clean`/`Elevated`/`Contaminated`/`Poisoned` actually mean and why the split between the middle two is deliberate.
 
@@ -289,6 +345,42 @@ audit log), never silently trusted at `Low` and never silently blocked
 outright, so an unclassified tool doesn't break your agent on day one, but is
 visibly flagged for you to go classify properly.
 
+## Downstream timeouts
+
+Both halves of the downstream connection — the discovery handshake
+(`initialize`/`tools/list`) and every `tools/call` — are bounded by a
+configurable timeout, so a stalled or hung downstream server can no
+longer wedge the gateway indefinitely.
+
+- Per-tool `timeout_seconds` in a `tools:` entry overrides the global
+  `security_policy.default_tool_timeout_seconds` (30s). Per-server
+  `discovery_timeout_seconds` in a `downstream_servers:` entry overrides
+  `security_policy.default_discovery_timeout_seconds` (15s). Neither
+  default is a measurement — they're policy judgment calls, the same as
+  this codebase's other tuning constants. Zero, negative, NaN, and
+  infinite values are all rejected at config-load time; there is no
+  "wait forever" setting.
+- A timeout rejects only that one call, with a distinct
+  `DownstreamTimeout` rejection code. It does not retry — most tools
+  aren't idempotent, and this project doesn't invent an
+  "idempotent/safe-to-retry" property to make retrying safe.
+- A SECOND consecutive timeout on the same connection marks it degraded
+  for the rest of the process's life: every further call to that server
+  fails immediately with `DownstreamConnectionDegraded`, without
+  attempting or waiting at all. A successful call resets the streak.
+  There's no automatic recovery — a genuinely wedged process needs a
+  gateway restart, not a health-check loop guessing at when it's safe
+  to try again.
+- A discovery-time timeout excludes just that server and starts the
+  gateway with whatever else discovered successfully — the hung server
+  shows up in the `--discovery-report`/console summary's failed-servers
+  section. The opt-in `security_policy.refuse_startup_on_discovery_timeout`
+  makes any discovery failure a hard startup refusal instead.
+- None of this — a single timeout, a degraded connection, either
+  discovery outcome — ever feeds the provenance/risk-budget machinery.
+  An absence isn't evidence about content, and there's no calibration
+  basis for treating it as a signal the way an actual rule hit is.
+
 ## Output schema conformance
 
 Some MCP tools declare an `outputSchema` alongside their `inputSchema` — a
@@ -352,7 +444,13 @@ not merged like documentation. Contributions welcome — see below.
 
 - [ ] `SourceRegistry`-style dynamic grading (promotion/demotion over time)
       v1 intentionally ships static, config-set grades only.
-- [ ] More than one downstream server exercised in the shipped demo config.
+- [x] Multi-server tool resolution — DONE. Configuring more than one
+      `downstream_servers:` entry is now resolved through an explicit
+      three-phase discovery pipeline (discover, quarantine, resolve) that
+      excludes any bare tool name claimed by more than one server, tested
+      end to end against real spawned processes. Separate, smaller item
+      still open: the shipped `config.yaml` demo itself only configures
+      one server — this is a demo-content gap now, not a capability gap.
 - [x] Homebrew tap — DONE. `vahive-tobias/homebrew-tap`, formula verified
       (correct license, version, and a real tested tag/revision pin), now
       backed by its own CI (`brew tap` → `brew audit --strict` →
@@ -370,24 +468,24 @@ not merged like documentation. Contributions welcome — see below.
       confusables/homoglyph skeletonization, and a depth-capped
       base64/hex decode-and-rescan peel. v1 covers case-folding, whitespace
       collapse, zero-width stripping, and Unicode Tag-block decode only.
-- [x] Entropy-based escalation for secret-shaped rules — DONE for
-      `SECRET-AWS-001`: a real leaked key and AWS's own documented
-      `AKIAIOSFODNN7EXAMPLE` placeholder no longer produce identical
-      flag-only outcomes. `SECRET-GH-001` has the identical gap and hasn't
-      been extended yet — no failing test has justified it, and this is
-      deliberately not done speculatively.
+- [x] Entropy-based escalation for secret-shaped rules — DONE for both
+      `SECRET-AWS-001` and `SECRET-GH-001`: a real leaked key/token and
+      each provider's own documented placeholder example no longer
+      produce identical flag-only outcomes.
 - [x] Fetch and validate a tool's declared `outputSchema` at discovery time
       so `SchemaConformance` can actually reach `Violated` instead of
-      sitting at `NotDeclared` — DONE. Still open: `pattern`-keyword
-      support (cheap, given `regex` is already a dependency with
-      size-bounded compilation this could reuse), and the full JSON Schema
-      vocabulary `schema_check.rs` deliberately doesn't cover — see that
-      file's header comment for the exact list.
-- [ ] Escalate registration-time tool-description hits (currently a
-      warning only, `scope: tool_description` in rules.yaml) to actually
-      withholding a tool on a high/critical match, the way an
-      `Unvalidated`/`Suspicious` source grade already withholds
-      descriptions.
+      sitting at `NotDeclared` — DONE, including `pattern`-keyword support.
+      Still open: the full JSON Schema vocabulary `schema_check.rs`
+      deliberately doesn't cover — see that file's header comment for the
+      exact list.
+- [x] Escalate registration-time tool-description hits beyond a
+      console-only warning — DONE, though what shipped routes through the
+      existing detection-severity tiers rather than a new
+      high/critical-specific rule: a poison-tier hit withholds a
+      description unconditionally, an elevate/flag-tier hit is sanitized
+      for forwarding and, under `security_policy.strict_description_scanning`,
+      withheld too — the same tiering `locked-rules.yaml`/`user-rules.yaml`
+      already use everywhere else, not a parallel one just for this.
 
 ## License
 
