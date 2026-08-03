@@ -52,6 +52,19 @@ pub fn decide_quarantine(status: &PinStatus, strict: bool) -> bool {
 /// sense as a stronger opt-in layered on top of `strict_schema_pinning`;
 /// setting it without strict mode is a nonsensical configuration, not a
 /// state that should silently do nothing or silently imply strict mode.
+///
+/// `refuse_startup_on_tool_name_collision` deliberately gets NO equivalent
+/// check here — confirmed by re-deriving the reasoning, not assumed from
+/// the flag's similar name/shape to `refuse_startup_on_pin_mismatch`:
+/// quarantine has a real warn-only middle tier (`strict_schema_pinning:
+/// false` still runs the mismatched tool, just without hash-pin
+/// enforcement), so "escalate past strict mode without strict mode set"
+/// is a genuine misconfiguration worth rejecting. Name-collision exclusion
+/// has no such middle tier — two tools genuinely cannot both answer to
+/// one bare name over a wire protocol with no server_id field, so
+/// exclusion is unconditional, not gated behind any flag. There is
+/// nothing for `refuse_startup_on_tool_name_collision` to be "layered on
+/// top of" that isn't already always on, so no prerequisite check applies.
 pub fn validate_policy(policy: &SecurityPolicy) -> Result<(), String> {
     if policy.refuse_startup_on_pin_mismatch && !policy.strict_schema_pinning {
         return Err(

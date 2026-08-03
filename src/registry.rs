@@ -55,6 +55,20 @@ pub struct SecurityPolicy {
     /// `main.rs`'s `sanitize_description`.
     #[serde(default)]
     pub strict_description_scanning: bool,
+    /// Escalates a discovered bare-tool-name collision (F3 — see
+    /// `docs/specs/Adversarial Review magus-opensecmcp.md`) from "exclude
+    /// both/all claimants, keep running" (always-on, unconditional — there
+    /// is no coherent "warn but leave them working" middle state for a
+    /// name two servers both claim, unlike a hash mismatch) to refusing
+    /// startup entirely. `false` by default. Unlike
+    /// `refuse_startup_on_pin_mismatch`, this has NO `strict_...`
+    /// prerequisite — confirmed deliberately, not assumed, in
+    /// `pin_policy::validate_policy`'s doc comment: the base "exclude"
+    /// behavior this escalates isn't gated behind any flag, so there's no
+    /// "escalation without its base" misconfiguration to reject the way
+    /// `refuse_startup_on_pin_mismatch` needs `strict_schema_pinning`.
+    #[serde(default)]
+    pub refuse_startup_on_tool_name_collision: bool,
 }
 
 /// The configuration for a downstream MCP server connection.

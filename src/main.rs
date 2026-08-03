@@ -47,12 +47,47 @@ struct PinMismatch {
 /// once per session — rather than recomputed or (as before this change)
 /// discarded immediately after the discovery-time `eprintln!`. Empty
 /// `rule_ids` means no hit at all (the common case). Keyed by
-/// `(server_id, tool_name)`, NOT tool name alone, unlike `tool_owner`/
-/// `tool_output_schemas`/`quarantined_tools` today (the still-open `F3`
-/// finding) — this must not add a fourth instance of that bug.
+/// `(server_id, tool_name)`, NOT tool name alone — this was already
+/// correctly composite-keyed before F3 (below) fixed the SAME bug class
+/// in `tool_owner`/`tool_output_schemas`; nothing here needed to change
+/// for F3, only for F3 to not regress this file's one existing example of
+/// getting the key right.
 struct DescriptionHitOutcome {
     has_poison: bool,
     rule_ids: Vec<String>,
+}
+
+/// F3 (see `docs/specs/Adversarial Review magus-opensecmcp.md`): which
+/// pipeline stage excluded a tool from the agent-facing tier, and why.
+/// Quarantine (SEC-03) and name-collision exclusion (F3) are structurally
+/// different reasons — a hash mismatch is about ONE server's tool being
+/// untrusted; a collision is about TWO OR MORE servers' tools being
+/// indistinguishable over the wire — but both need the same downstream
+/// handling (excluded from `tools/list`/`tools/call`, one distinct
+/// `magus_rejection_code`, one audit event, one line in the discovery
+/// summary), so one shared record type carries both rather than two
+/// parallel ad hoc structures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExclusionStage {
+    Quarantine,
+    NameCollision,
+}
+
+/// One tool excluded from the agent-facing tier, with the single
+/// authoritative reason. "Single" is load-bearing: quarantine (phase 2)
+/// runs strictly before collision detection (phase 3) specifically so a
+/// tool that would have collided ANYWAY, but was already quarantined for
+/// an unrelated reason, gets exactly one exclusion record
+/// (`Quarantine`) — not a second, confusing `NameCollision` record on
+/// top, and not a phantom collision against a name that's actually only
+/// claimed by one surviving tool once the quarantined one is gone. See
+/// the phase-3 resolution loop for the concrete case this ordering
+/// prevents.
+struct ToolExclusion {
+    server_id: String,
+    tool_name: String,
+    stage: ExclusionStage,
+    reason: String,
 }
 
 // `sanitize_description` reads `Option<&DescriptionHitOutcome>` and
@@ -68,24 +103,87 @@ struct DescriptionHitOutcome {
 // `handle_tools_list` (e.g. dynamic re-discovery), this invariant needs
 // re-checking, not assuming it still holds.
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let first_arg = std::env::args().nth(1);
-    match first_arg.as_deref() {
-        Some("--version") | Some("-V") => {
-            println!("magus-gateway {}", env!("CARGO_PKG_VERSION"));
-            std::process::exit(0);
+/// Parsed command line, before any of it has been acted on. `--version`/
+/// `--help` used to be the only recognized flags, handled by a single-slot
+/// `args().nth(1)` match — that shape can't represent
+/// `magus-gateway config.yaml --discovery-report` (a flag that coexists
+/// with a positional config path, in either order), so this replaces it
+/// with a small manual parser over every argument. Deliberately not a CLI
+/// crate dependency — the surface (three flags, one optional positional
+/// argument) is far too small to justify one.
+struct CliArgs {
+    show_version: bool,
+    show_help: bool,
+    discovery_report: bool,
+    config_path: String,
+}
+
+/// Splits on a leading `-`/`--` to distinguish a flag from the one
+/// positional config-path argument, in either order. Fails closed on
+/// anything it doesn't recognize — an unrecognized flag or a second
+/// positional argument is a clear usage error, not silently ignored or
+/// silently treated as the config path; a typo'd flag (`--discvery-report`)
+/// silently doing nothing would be a worse failure mode than a startup
+/// error naming the problem.
+fn parse_args(raw_args: &[String]) -> Result<CliArgs, String> {
+    let mut show_version = false;
+    let mut show_help = false;
+    let mut discovery_report = false;
+    let mut config_path: Option<String> = None;
+
+    for arg in raw_args {
+        match arg.as_str() {
+            "--version" | "-V" => show_version = true,
+            "--help" | "-h" => show_help = true,
+            "--discovery-report" => discovery_report = true,
+            other if other.starts_with('-') => {
+                return Err(format!("unrecognized flag: {}", other));
+            }
+            other => {
+                if config_path.is_some() {
+                    return Err(format!("unexpected extra argument: {} (only one config path is accepted)", other));
+                }
+                config_path = Some(other.to_string());
+            }
         }
-        Some("--help") | Some("-h") => {
-            println!("magus-gateway - a deterministic execution firewall for MCP agents.");
-            println!();
-            println!("Usage: magus-gateway [config.yaml]");
-            std::process::exit(0);
-        }
-        _ => {}
     }
 
-    let config_path = PathBuf::from(first_arg.unwrap_or_else(|| "config.yaml".to_string()));
+    Ok(CliArgs {
+        show_version,
+        show_help,
+        discovery_report,
+        config_path: config_path.unwrap_or_else(|| "config.yaml".to_string()),
+    })
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    let cli = match parse_args(&raw_args) {
+        Ok(c) => c,
+        Err(msg) => {
+            eprintln!("[MAGUS] FATAL: {}", msg);
+            eprintln!("[MAGUS] Usage: magus-gateway [config.yaml] [--discovery-report]");
+            std::process::exit(1);
+        }
+    };
+
+    if cli.show_version {
+        println!("magus-gateway {}", env!("CARGO_PKG_VERSION"));
+        std::process::exit(0);
+    }
+    if cli.show_help {
+        println!("magus-gateway - a deterministic execution firewall for MCP agents.");
+        println!();
+        println!("Usage: magus-gateway [config.yaml] [--discovery-report]");
+        println!();
+        println!("  --discovery-report   Run discovery, print the tool availability");
+        println!("                       summary to stdout, and exit before entering");
+        println!("                       the agent-facing stdio loop.");
+        std::process::exit(0);
+    }
+
+    let config_path = PathBuf::from(&cli.config_path);
     if !config_path.exists() {
         eprintln!("[MAGUS] FATAL: config file not found at {:?}", config_path);
         eprintln!("[MAGUS] Usage: magus-gateway [path/to/config.yaml]");
@@ -171,19 +269,17 @@ async fn main() -> Result<()> {
     let session_id = Uuid::new_v4().to_string();
     let audit_logger = Arc::new(AuditLogger::new(&session_id));
 
-    // ---- Spawn + initialize every configured downstream server, discover its
-    //      real tools, and hash-pin each definition. This is the step the
-    //      original draft never did — nothing was ever actually connected to.
+    // ==== PHASE 1: DISCOVER ====================================================
+    // Spawn + initialize every configured downstream server, collect every
+    // tool it advertises, compute pin status, description-hit outcome, and
+    // schema info. Deliberately does NOT build tool_owner/tool_output_schemas
+    // yet (that used to happen inline here, per-tool, with no collision
+    // check at all — the F3 bug: whichever server was processed last in
+    // config order silently won any bare-name collision). `discovered`
+    // starts with EVERY tool from EVERY server, unfiltered — phases 2 and 3
+    // below progressively narrow it to the agent-facing set.
     let mut connections: HashMap<String, Arc<Mutex<DownstreamConnection>>> = HashMap::new();
     let mut discovered: Vec<DiscoveredServer> = Vec::new();
-    let mut tool_owner: HashMap<String, String> = HashMap::new(); // tool_name -> server_id
-    // tool_name -> declared outputSchema, for tools that have one. Consulted
-    // in handle_tools_call to populate SchemaConformance instead of leaving
-    // it at NotDeclared forever — see schema_check.rs for what "conformance"
-    // does and doesn't mean here, and provenance.rs for how Violated feeds
-    // the state machine (it already did before this change; only the
-    // population of the value was missing).
-    let mut tool_output_schemas: HashMap<String, serde_json::Value> = HashMap::new();
     // Confirmed hash-pin mismatches, collected across every server/tool
     // during discovery. Acted on only after the full loop below completes —
     // see the refuse-startup / quarantine decision after it.
@@ -191,7 +287,7 @@ async fn main() -> Result<()> {
     // Tool-description rule-scan outcome, keyed (server_id, tool_name) — see
     // DescriptionHitOutcome. Consulted by handle_tools_list/
     // sanitize_description, not discarded after discovery the way it used
-    // to be.
+    // to be. Already correctly composite-keyed; F3 doesn't touch this.
     let mut description_hits: HashMap<(String, String), DescriptionHitOutcome> = HashMap::new();
 
     for server_cfg in &registry.servers {
@@ -293,13 +389,17 @@ async fn main() -> Result<()> {
                 );
             }
 
-            // Cache the declared outputSchema (if any) for response-time
-            // conformance checking, and flag at discovery time — not as a
-            // signature hit, just a heads-up — if the server got the one
-            // structural rule the MCP 2025-06-18 spec itself imposes wrong:
-            // outputSchema's root must be `type: "object"`. Getting this
-            // wrong is far more likely to be an unmaintained server than a
-            // malicious one, so this stays a warning, not an elevation.
+            // Flag at discovery time — not as a signature hit, just a
+            // heads-up — if the server got the one structural rule the MCP
+            // 2025-06-18 spec itself imposes wrong: outputSchema's root
+            // must be `type: "object"`. Getting this wrong is far more
+            // likely to be an unmaintained server than a malicious one, so
+            // this stays a warning, not an elevation. The schema value
+            // itself is NOT cached into a bare-name-keyed map here anymore
+            // (that was the same F3 bug class as tool_owner) — it's still
+            // sitting on `t.output_schema` inside `discovered`, and gets
+            // promoted into `tool_output_schemas` in phase 3 below, only
+            // for tools that actually survive to the clean tier.
             if let Some(schema) = &t.output_schema {
                 if !schema_check::root_is_object_type(schema) {
                     eprintln!(
@@ -312,10 +412,7 @@ async fn main() -> Result<()> {
                         ("tool_name".to_string(), serde_json::json!(t.name)),
                     ]));
                 }
-                tool_output_schemas.insert(t.name.clone(), schema.clone());
             }
-
-            tool_owner.insert(t.name.clone(), server_cfg.server_id.clone());
         }
 
         connections.insert(server_cfg.server_id.clone(), Arc::new(Mutex::new(conn)));
@@ -346,20 +443,203 @@ async fn main() -> Result<()> {
         std::process::exit(3);
     }
 
-    // Tool name -> human-readable reason. Checked in handle_tools_call
-    // before the tool_owner lookup, so a quarantined tool gets a distinct,
-    // specific rejection instead of looking like it never existed.
-    let mut quarantined_tools: HashMap<String, String> = HashMap::new();
+    // ==== PHASE 2: QUARANTINE (SEC-03, essentially unchanged) ==================
+    // Runs strictly BEFORE phase 3's collision detection — load-bearing,
+    // not a preference. If server A's tool is quarantined here for a pin
+    // mismatch and server B has a clean tool of the same bare name,
+    // removing A's tool from `discovered` FIRST means phase 3 below only
+    // ever sees B's tool for that name — no collision at all, it just
+    // works, with one exclusion record (Quarantine), not two overlapping
+    // ones for the same underlying situation. Collision-detection-first
+    // would have excluded B's tool too, for a "collision" that was never
+    // real once A's was already gone for an unrelated reason.
+    let mut discovered_quarantined: Vec<ToolExclusion> = Vec::new();
     if registry.security_policy.strict_schema_pinning {
         for m in &mismatches {
             let reason = format!("hash mismatch: expected {}, got {}", m.expected, m.actual);
-            eprintln!("[MAGUS] QUARANTINED '{}'/{}: {}", m.server_id, m.tool_name, reason);
-            tool_owner.remove(&m.tool_name);
+            eprintln!("[MAGUS] QUARANTINED (hash mismatch) '{}'/{}: {}", m.server_id, m.tool_name, reason);
             if let Some(ds) = discovered.iter_mut().find(|d| d.server_id == m.server_id) {
                 ds.tools.retain(|t| t.name != m.tool_name);
             }
-            quarantined_tools.insert(m.tool_name.clone(), reason);
+            discovered_quarantined.push(ToolExclusion {
+                server_id: m.server_id.clone(),
+                tool_name: m.tool_name.clone(),
+                stage: ExclusionStage::Quarantine,
+                reason,
+            });
         }
+    }
+
+    // ==== PHASE 3: RESOLVE (F3 — new) ===========================================
+    // Walks the post-quarantine survivor set and groups by bare tool
+    // name — the only field MCP's `tools/call` actually carries on the
+    // wire, no `server_id`. A name still claimed by 2+ surviving tools is
+    // structurally ambiguous: nothing about which server "should" win is
+    // knowable from the protocol itself, so ALL claimants are excluded,
+    // not just the extras. No tiebreak (first-registered-wins,
+    // higher-SourceGrade-wins) — either would make config.yaml's
+    // `downstream_servers:` ORDER (or grade) an implicit, easy-to-miss
+    // security decision: a less-trusted server's tool could silently
+    // shadow a more-trusted one just by how the file happens to be
+    // written. Excluding the whole group is blunter but symmetric and
+    // depends on nothing accidental.
+    //
+    // Two passes, deliberately: the first builds a read-only tally of
+    // every surviving name's claimants; the second mutates `discovered`
+    // using that tally. Interleaving them would mean a name's collision
+    // status could depend on iteration order (has this claimant been
+    // counted yet?) rather than the actual final count — a real
+    // correctness bug this two-pass shape avoids by construction, not by
+    // luck.
+    let mut name_occurrences: HashMap<String, Vec<String>> = HashMap::new();
+    for server in &discovered {
+        for t in &server.tools {
+            name_occurrences.entry(t.name.clone()).or_default().push(server.server_id.clone());
+        }
+    }
+
+    let mut discovered_with_issues: Vec<ToolExclusion> = Vec::new();
+    for server in &mut discovered {
+        let server_id = server.server_id.clone();
+        server.tools.retain(|t| {
+            let claimants = &name_occurrences[&t.name];
+            if claimants.len() <= 1 {
+                return true; // unique among survivors — safe to keep
+            }
+            let others: Vec<&str> = claimants.iter().filter(|s| **s != server_id).map(|s| s.as_str()).collect();
+            let reason = format!("also registered by server(s): {}", others.join(", "));
+            eprintln!("[MAGUS] EXCLUDED (name collision) '{}'/{}: {}", server_id, t.name, reason);
+            audit_logger.log_event("tool_name_collision", serde_json::Map::from_iter([
+                ("server_id".to_string(), serde_json::json!(server_id)),
+                ("tool_name".to_string(), serde_json::json!(t.name)),
+                ("claimants".to_string(), serde_json::json!(claimants)),
+            ]));
+            discovered_with_issues.push(ToolExclusion {
+                server_id: server_id.clone(),
+                tool_name: t.name.clone(),
+                stage: ExclusionStage::NameCollision,
+                reason,
+            });
+            false
+        });
+    }
+
+    // `refuse_startup_on_tool_name_collision` — the opt-in escalation on
+    // top of the always-on "exclude, keep running" default above. No
+    // `strict_...` prerequisite check needed here — see
+    // pin_policy::validate_policy's doc comment for why that's confirmed,
+    // not assumed. Checked here, once the complete post-resolution
+    // picture is known, mirroring where refuse_startup_on_pin_mismatch is
+    // checked relative to phase 1's mismatches.
+    if registry.security_policy.refuse_startup_on_tool_name_collision && !discovered_with_issues.is_empty() {
+        eprintln!(
+            "[MAGUS] FATAL: refuse_startup_on_tool_name_collision is set and {} tool(s) were excluded for a bare-name collision:",
+            discovered_with_issues.len()
+        );
+        for e in &discovered_with_issues {
+            eprintln!("[MAGUS]   '{}'/{}: {}", e.server_id, e.tool_name, e.reason);
+        }
+        std::process::exit(4);
+    }
+
+    // NOW safe to build tool_owner/tool_output_schemas from bare names —
+    // this is the ONE point in the pipeline where bare-name uniqueness has
+    // actually been established by phase 3 above, not assumed the way it
+    // was before F3. handle_tools_list and description_hits need ZERO
+    // changes: they consume `discovered` directly and inherit correctness
+    // for free once this phase guarantees it.
+    let mut tool_owner: HashMap<String, String> = HashMap::new(); // tool_name -> server_id
+    // tool_name -> declared outputSchema, for tools that have one. Consulted
+    // in handle_tools_call to populate SchemaConformance instead of leaving
+    // it at NotDeclared forever — see schema_check.rs for what "conformance"
+    // does and doesn't mean here, and provenance.rs for how Violated feeds
+    // the state machine.
+    let mut tool_output_schemas: HashMap<String, serde_json::Value> = HashMap::new();
+    for server in &discovered {
+        for t in &server.tools {
+            tool_owner.insert(t.name.clone(), server.server_id.clone());
+            if let Some(schema) = &t.output_schema {
+                tool_output_schemas.insert(t.name.clone(), schema.clone());
+            }
+        }
+    }
+
+    // Unified bare-name-keyed exclusion lookup for handle_tools_call's
+    // rejection path — the ONE place a bare-name-keyed map is actually
+    // safe here, PROVIDED it only holds names with no surviving owner.
+    // Collision exclusions already guarantee that for free: phase 3's
+    // retain() above removes every colliding entry from `discovered`
+    // before tool_owner is built, so a name in discovered_with_issues can
+    // never also be in tool_owner.
+    //
+    // Quarantine exclusions do NOT get that guarantee for free, and
+    // inserting them unconditionally here was a real bug caught by this
+    // module's own tests: quarantine removes one server's instance of a
+    // name, not the name itself, so a second, clean server can still be
+    // the name's sole surviving owner (tool_owner correctly routes to it)
+    // while the quarantined instance's exclusion record for that same
+    // bare name would otherwise still shadow it here and reject every
+    // call before tool_owner is ever consulted. Skipping any quarantine
+    // exclusion whose name already has an owner fixes that — the
+    // quarantined instance itself is still fully reported in
+    // discovered_quarantined for the summary/audit either way, this only
+    // controls whether calling the bare name is blocked.
+    let mut excluded_tools: HashMap<String, ToolExclusion> = HashMap::new();
+    for exclusion in &discovered_quarantined {
+        if tool_owner.contains_key(&exclusion.tool_name) {
+            continue;
+        }
+        excluded_tools.insert(exclusion.tool_name.clone(), ToolExclusion {
+            server_id: exclusion.server_id.clone(),
+            tool_name: exclusion.tool_name.clone(),
+            stage: exclusion.stage,
+            reason: exclusion.reason.clone(),
+        });
+    }
+    for exclusion in &discovered_with_issues {
+        excluded_tools.insert(exclusion.tool_name.clone(), ToolExclusion {
+            server_id: exclusion.server_id.clone(),
+            tool_name: exclusion.tool_name.clone(),
+            stage: exclusion.stage,
+            reason: exclusion.reason.clone(),
+        });
+    }
+
+    // One durable snapshot of the complete tier breakdown, rather than
+    // something an operator has to reconstruct later by collecting the
+    // scattered per-finding events above — cheap, since the classification
+    // data already exists in memory at this point.
+    let tool_count: usize = discovered.iter().map(|d| d.tools.len()).sum();
+    audit_logger.log_event(
+        "discovery_summary",
+        discovery_summary_audit_fields(tool_count, discovered_quarantined.len(), discovered_with_issues.len()),
+    );
+
+    let summary = discovery_summary(tool_count, &discovered_quarantined, &discovered_with_issues);
+    // The final tally, printed IN ADDITION to the per-finding warnings
+    // already printed in real time above as each was discovered — this
+    // doesn't replace those, it's the summary on top of them. Only the
+    // headline line gets the "[MAGUS] " prefix every other line in this
+    // file uses; the breakdown underneath is a clean, unprefixed block —
+    // readable as a stand-alone report either here (stderr) or in
+    // --discovery-report mode (stdout, see below), not something that
+    // needs re-formatting to work in both places.
+    eprintln!("[MAGUS] {}", summary.lines().collect::<Vec<_>>().join("\n"));
+
+    // --discovery-report: recognized early (see parse_args) but
+    // deliberately NOT an instant exit the way --version/--help are —
+    // unlike those, this needs a REAL discovery pass (real spawned
+    // servers, real computed hashes), so it pays the same startup cost
+    // normal operation does and can only exit here, after phases 1-3
+    // finish, at the exact point normal operation would otherwise print
+    // "Gateway active..." and enter the stdio loop. Printed to STDOUT,
+    // deliberately different from this file's stderr-only convention
+    // everywhere else: the stdio loop never starts in this mode, so
+    // stdout is never reserved for JSON-RPC traffic here, and stdout is
+    // the more usable choice (redirectable, pipeable) once that's true.
+    if cli.discovery_report {
+        println!("{}", summary);
+        std::process::exit(0);
     }
 
     // ---- Core governance components (session_id/audit_logger now
@@ -406,7 +686,7 @@ async fn main() -> Result<()> {
                 &id, &discovered, &description_hits, registry.security_policy.strict_description_scanning,
             )),
             "tools/call" => Some(handle_tools_call(
-                &id, &json_rpc, &registry, &rule_engine, &tool_owner, &quarantined_tools, &tool_output_schemas, &connections,
+                &id, &json_rpc, &registry, &rule_engine, &tool_owner, &excluded_tools, &tool_output_schemas, &connections,
                 &membrane, &provenance_tracker, &audit_logger, connection_id,
             ).await),
             _ if is_notification => None,
@@ -429,6 +709,152 @@ async fn main() -> Result<()> {
     }
     eprintln!("[MAGUS] Agent disconnected. Shutting down.");
     Ok(())
+}
+
+/// The end-of-discovery tally — shared between the always-on stderr
+/// summary and `--discovery-report`'s stdout output, so the two modes
+/// can never drift into showing different numbers. Exact wording is not
+/// load-bearing (no test asserts on it byte-for-byte); the SHAPE is:
+/// final tally line, then one section per non-empty exclusion tier, each
+/// with a per-item line and a remediation hint.
+fn discovery_summary(available_count: usize, quarantined: &[ToolExclusion], with_issues: &[ToolExclusion]) -> String {
+    let excluded_count = quarantined.len() + with_issues.len();
+    let mut out = format!(
+        "Discovery complete: {} tool(s) available to the agent, {} excluded.\n",
+        available_count, excluded_count
+    );
+
+    if !with_issues.is_empty() {
+        out.push_str(&format!(
+            "\nDISCOVERED WITH ISSUES ({}) — name collision, not available to the agent:\n",
+            with_issues.len()
+        ));
+        for e in with_issues {
+            out.push_str(&format!("  {}/{}   ({})\n", e.server_id, e.tool_name, e.reason));
+        }
+        out.push_str(
+            "  To fix: avoid running both servers together, or rename the conflicting\n\
+             \x20\x20tool at the source. No in-band rename exists in v1 — that's a real\n\
+             \x20\x20limitation, not a hidden option.\n",
+        );
+    }
+
+    if !quarantined.is_empty() {
+        out.push_str(&format!(
+            "\nQUARANTINED ({}) — hash-pin mismatch, not available to the agent:\n",
+            quarantined.len()
+        ));
+        for e in quarantined {
+            out.push_str(&format!("  {}/{}  ({})\n", e.server_id, e.tool_name, e.reason));
+        }
+        out.push_str(
+            "  To fix: review the change; if legitimate, update pinned_definition_hash_hex\n\
+             \x20\x20in config.yaml.\n",
+        );
+    }
+
+    out.trim_end().to_string()
+}
+
+/// The `discovery_summary` audit event's field set — extracted into its
+/// own pure function for the same reason `discovery_summary` above is one:
+/// directly unit-testable without spawning a real gateway process, which
+/// an e2e test can't do for audit-log content anyway (`AuditLogger::new`
+/// writes to the real `~/.magus/audit.jsonl` on whatever machine runs the
+/// compiled binary, with no config-driven override — only
+/// `AuditLogger::new_with_path`, `#[cfg(test)]`-only, can redirect it, and
+/// only for in-process tests, not a spawned child process).
+fn discovery_summary_audit_fields(
+    available_count: usize,
+    quarantined_count: usize,
+    name_collision_count: usize,
+) -> serde_json::Map<String, serde_json::Value> {
+    serde_json::Map::from_iter([
+        ("available_count".to_string(), serde_json::json!(available_count)),
+        ("quarantined_count".to_string(), serde_json::json!(quarantined_count)),
+        ("name_collision_count".to_string(), serde_json::json!(name_collision_count)),
+    ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- parse_args ----
+
+    #[test]
+    fn parse_args_defaults_to_config_yaml_with_no_args() {
+        let cli = parse_args(&[]).expect("no args must parse successfully");
+        assert_eq!(cli.config_path, "config.yaml");
+        assert!(!cli.show_version && !cli.show_help && !cli.discovery_report);
+    }
+
+    #[test]
+    fn parse_args_accepts_config_path_and_flag_in_either_order() {
+        let a = parse_args(&["myconfig.yaml".to_string(), "--discovery-report".to_string()])
+            .expect("config path then flag must parse");
+        assert_eq!(a.config_path, "myconfig.yaml");
+        assert!(a.discovery_report);
+
+        let b = parse_args(&["--discovery-report".to_string(), "myconfig.yaml".to_string()])
+            .expect("flag then config path must parse");
+        assert_eq!(b.config_path, "myconfig.yaml");
+        assert!(b.discovery_report);
+    }
+
+    #[test]
+    fn parse_args_rejects_an_unrecognized_flag() {
+        assert!(parse_args(&["--nonsense".to_string()]).is_err(), "an unrecognized flag must fail closed, not be silently ignored");
+    }
+
+    #[test]
+    fn parse_args_rejects_two_positional_arguments() {
+        assert!(
+            parse_args(&["one.yaml".to_string(), "two.yaml".to_string()]).is_err(),
+            "a second positional argument must be rejected, not silently overwrite the first"
+        );
+    }
+
+    // ---- discovery_summary ----
+
+    fn exclusion(server_id: &str, tool_name: &str, stage: ExclusionStage, reason: &str) -> ToolExclusion {
+        ToolExclusion { server_id: server_id.to_string(), tool_name: tool_name.to_string(), stage, reason: reason.to_string() }
+    }
+
+    #[test]
+    fn discovery_summary_with_no_exclusions_has_no_tier_sections() {
+        let summary = discovery_summary(5, &[], &[]);
+        assert!(summary.contains("5 tool(s) available to the agent, 0 excluded"));
+        assert!(!summary.contains("QUARANTINED"));
+        assert!(!summary.contains("DISCOVERED WITH ISSUES"));
+    }
+
+    #[test]
+    fn discovery_summary_includes_both_tiers_when_both_are_present() {
+        let quarantined = vec![exclusion("srv-a", "move_file", ExclusionStage::Quarantine, "hash mismatch: expected X, got Y")];
+        let with_issues = vec![
+            exclusion("srv-b", "search", ExclusionStage::NameCollision, "also registered by server(s): srv-c"),
+            exclusion("srv-c", "search", ExclusionStage::NameCollision, "also registered by server(s): srv-b"),
+        ];
+        let summary = discovery_summary(3, &quarantined, &with_issues);
+
+        assert!(summary.contains("3 tool(s) available to the agent, 3 excluded"));
+        assert!(summary.contains("QUARANTINED (1)"));
+        assert!(summary.contains("srv-a/move_file"));
+        assert!(summary.contains("DISCOVERED WITH ISSUES (2)"));
+        assert!(summary.contains("srv-b/search"));
+        assert!(summary.contains("srv-c/search"));
+    }
+
+    // ---- discovery_summary_audit_fields ----
+
+    #[test]
+    fn discovery_summary_audit_fields_has_the_expected_shape() {
+        let fields = discovery_summary_audit_fields(11, 1, 2);
+        assert_eq!(fields.get("available_count"), Some(&serde_json::json!(11)));
+        assert_eq!(fields.get("quarantined_count"), Some(&serde_json::json!(1)));
+        assert_eq!(fields.get("name_collision_count"), Some(&serde_json::json!(2)));
+    }
 }
 
 fn handle_initialize(id: &serde_json::Value) -> serde_json::Value {
@@ -591,7 +1017,7 @@ async fn handle_tools_call(
     registry: &ToolRegistry,
     rule_engine: &RuleEngine,
     tool_owner: &HashMap<String, String>,
-    quarantined_tools: &HashMap<String, String>,
+    excluded_tools: &HashMap<String, ToolExclusion>,
     tool_output_schemas: &HashMap<String, serde_json::Value>,
     connections: &HashMap<String, Arc<Mutex<DownstreamConnection>>>,
     membrane: &Arc<Mutex<Membrane>>,
@@ -610,13 +1036,20 @@ async fn handle_tools_call(
     // already knows this tool's name (cached from an earlier session, or
     // from documentation) and calls it directly must get a distinct,
     // specific rejection, not a generic "Unknown tool" that makes it look
-    // like the tool never existed.
-    if let Some(reason) = quarantined_tools.get(tool_name) {
+    // like the tool never existed. Two distinct stages, two distinct
+    // rejection codes — "ToolQuarantinedPinMismatch" must survive
+    // byte-for-byte unchanged (pin_enforcement.rs asserts on it directly);
+    // "ToolExcludedNameCollision" is new for F3.
+    if let Some(exclusion) = excluded_tools.get(tool_name) {
+        let (code, prefix) = match exclusion.stage {
+            ExclusionStage::Quarantine => ("ToolQuarantinedPinMismatch", "Tool quarantined"),
+            ExclusionStage::NameCollision => ("ToolExcludedNameCollision", "Tool excluded"),
+        };
         return jsonrpc_error(
             id,
             -32602,
-            &format!("Tool quarantined: {}", reason),
-            Some("ToolQuarantinedPinMismatch"),
+            &format!("{}: {}", prefix, exclusion.reason),
+            Some(code),
         );
     }
 
