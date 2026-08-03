@@ -761,13 +761,37 @@ fn decode_unicode_tags(s: &str) -> String {
         .collect()
 }
 
+/// Sibling to `decode_unicode_tags`, for content that gets FORWARDED to a
+/// model rather than just matched against for detection. Decoding a
+/// Tag-block-smuggled instruction back to visible ASCII and then
+/// forwarding it would make the smuggled content MORE dangerous, not
+/// less — readable instead of invisible-but-present. There is no
+/// legitimate reason a tool description needs Tag-block codepoints to
+/// reach a model at all, so the forwarding-safe operation is DELETION,
+/// not decoding. Covers the full documented block (U+E0001, the
+/// printable mirror range, and U+E007F), not just the printable subset
+/// `decode_unicode_tags` needs — deletion has no reason to be narrower
+/// than the block itself, unlike decoding, which only produces something
+/// meaningful for the printable-mirror subset.
+pub fn delete_unicode_tags(s: &str) -> String {
+    s.chars()
+        .filter(|c| {
+            let cp = *c as u32;
+            !(cp == 0xE0001 || (0xE0020..=0xE007E).contains(&cp) || cp == 0xE007F)
+        })
+        .collect()
+}
+
 /// Strips the zero-width characters most commonly used to fragment a
 /// keyword across matcher boundaries (e.g. "i<ZWSP>g<ZWSP>nore"). Complex
 /// script and emoji text legitimately uses ZWJ too, but this proxy is
 /// matching against tool output for known-bad phrasing, not rendering text,
 /// so stripping unconditionally (rather than density-gating, which the
 /// fuller pipeline discussion called for) is an acceptable v1 trade-off.
-fn strip_zero_width(s: &str) -> String {
+/// `pub`: also reused as-is by `main.rs`'s `sanitize_for_forwarding` — same
+/// deletion, not just the same reasoning, since a zero-width character has
+/// no legitimate reason to reach a model either.
+pub fn strip_zero_width(s: &str) -> String {
     s.chars()
         .filter(|c| !matches!(*c, '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{2060}' | '\u{FEFF}'))
         .collect()
@@ -846,6 +870,37 @@ mod tests {
     fn zero_width_fragmented_keyword_collapses() {
         let fragmented = "ig\u{200B}no\u{200B}re";
         assert_eq!(strip_zero_width(fragmented), "ignore");
+    }
+
+    /// `delete_unicode_tags` DELETES, unlike `decode_unicode_tags` which
+    /// reveals — "hi" spelled in Tag characters must vanish entirely, not
+    /// become the visible text "hi" the way `normalize_for_matching`
+    /// (detection-side) would decode it.
+    #[test]
+    fn delete_unicode_tags_removes_rather_than_reveals() {
+        let smuggled = "\u{E0068}\u{E0069}";
+        assert_eq!(delete_unicode_tags(smuggled), "", "tag-block content must be deleted, not decoded to visible text");
+        assert_ne!(
+            delete_unicode_tags(smuggled), normalize_for_matching(smuggled),
+            "deletion (forwarding-safe) and decoding (detection-side) must produce different results for the same input"
+        );
+    }
+
+    /// Covers the two boundary codepoints (U+E0001 language tag, U+E007F
+    /// cancel tag) that `decode_unicode_tags` deliberately doesn't handle
+    /// (they have no printable-ASCII equivalent to decode to) but
+    /// `delete_unicode_tags` must still remove, since deletion doesn't need
+    /// a visible target the way decoding does.
+    #[test]
+    fn delete_unicode_tags_covers_the_full_block_not_just_the_printable_subset() {
+        let with_boundaries = "a\u{E0001}b\u{E007F}c";
+        assert_eq!(delete_unicode_tags(with_boundaries), "abc");
+    }
+
+    #[test]
+    fn delete_unicode_tags_leaves_ordinary_text_untouched() {
+        let ordinary = "a normal tool description, nothing smuggled here";
+        assert_eq!(delete_unicode_tags(ordinary), ordinary);
     }
 
     #[test]

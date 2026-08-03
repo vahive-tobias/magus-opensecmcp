@@ -47,6 +47,14 @@ pub struct SecurityPolicy {
     pub strict_schema_pinning: bool,
     #[serde(default)]
     pub refuse_startup_on_pin_mismatch: bool,
+    /// Escalates an elevate/flag-tier tool-description rule hit (from an
+    /// Attested/Known-graded server) from sanitize-and-warn to full
+    /// withholding — same shape as `strict_schema_pinning`, `false` by
+    /// default (today's behavior, unchanged). A poison-tier description
+    /// hit withholds unconditionally regardless of this flag; see
+    /// `main.rs`'s `sanitize_description`.
+    #[serde(default)]
+    pub strict_description_scanning: bool,
 }
 
 /// The configuration for a downstream MCP server connection.

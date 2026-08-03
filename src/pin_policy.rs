@@ -73,6 +73,7 @@ mod tests {
         SecurityPolicy {
             strict_schema_pinning: strict,
             refuse_startup_on_pin_mismatch: refuse,
+            ..Default::default()
         }
     }
 

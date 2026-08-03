@@ -24,7 +24,6 @@ const DEFAULT_MONTHLY_EVAL_LIMIT: u32 = 5_000;
 
 /// Everything discovery produces for one downstream server: real tool
 /// definitions, plus the hash-pinning result for each.
-#[allow(dead_code)]
 struct DiscoveredServer {
     server_id: String,
     source_grade: SourceGrade,
@@ -41,6 +40,33 @@ struct PinMismatch {
     expected: String,
     actual: String,
 }
+
+/// Outcome of the tool-description rule scan at discovery time, cached for
+/// consultation in `handle_tools_list`/`sanitize_description` — a separate
+/// function, invoked on every `tools/list` request, potentially more than
+/// once per session — rather than recomputed or (as before this change)
+/// discarded immediately after the discovery-time `eprintln!`. Empty
+/// `rule_ids` means no hit at all (the common case). Keyed by
+/// `(server_id, tool_name)`, NOT tool name alone, unlike `tool_owner`/
+/// `tool_output_schemas`/`quarantined_tools` today (the still-open `F3`
+/// finding) — this must not add a fourth instance of that bug.
+struct DescriptionHitOutcome {
+    has_poison: bool,
+    rule_ids: Vec<String>,
+}
+
+// `sanitize_description` reads `Option<&DescriptionHitOutcome>` and
+// defaults a missing entry to "no hit" (`unwrap_or(false)` on both
+// checks) — a fail-OPEN default for a security-relevant decision, worth
+// being explicit about rather than leaving implicit: this is safe only
+// because the discovery loop below inserts an entry, unconditionally, in
+// BOTH branches (hit and no-hit) for every tool it processes, and
+// `discovered`/`description_hits` are both immutable for the rest of the
+// process after discovery finishes — there is no code path that adds a
+// tool to `discovered` without also inserting its outcome here. If a
+// future change ever adds a second way for a tool to reach
+// `handle_tools_list` (e.g. dynamic re-discovery), this invariant needs
+// re-checking, not assuming it still holds.
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -134,6 +160,17 @@ async fn main() -> Result<()> {
         std::process::exit(2);
     }
 
+    // ---- session_id / audit_logger, moved ahead of discovery (they used to
+    //      live under "Core governance components" further down, after
+    //      discovery finished). Neither depends on anything discovery
+    //      produces — session_id is just a fresh UUID — and discovery now
+    //      needs a working AuditLogger of its own, to close the same
+    //      stderr-only gap for hash-pin mismatches, non-object outputSchema
+    //      roots, and (new) tool-description rule hits, none of which
+    //      persisted anywhere but the console before this change.
+    let session_id = Uuid::new_v4().to_string();
+    let audit_logger = Arc::new(AuditLogger::new(&session_id));
+
     // ---- Spawn + initialize every configured downstream server, discover its
     //      real tools, and hash-pin each definition. This is the step the
     //      original draft never did — nothing was ever actually connected to.
@@ -151,6 +188,11 @@ async fn main() -> Result<()> {
     // during discovery. Acted on only after the full loop below completes —
     // see the refuse-startup / quarantine decision after it.
     let mut mismatches: Vec<PinMismatch> = Vec::new();
+    // Tool-description rule-scan outcome, keyed (server_id, tool_name) — see
+    // DescriptionHitOutcome. Consulted by handle_tools_list/
+    // sanitize_description, not discarded after discovery the way it used
+    // to be.
+    let mut description_hits: HashMap<(String, String), DescriptionHitOutcome> = HashMap::new();
 
     for server_cfg in &registry.servers {
         eprintln!("[MAGUS] Spawning downstream '{}': {} {:?}", server_cfg.server_id, server_cfg.command, server_cfg.args);
@@ -179,6 +221,12 @@ async fn main() -> Result<()> {
                          [MAGUS]   the same as an unreviewed new tool until you've confirmed the change is legitimate.",
                         server_cfg.server_id, t.name, expected, actual
                     );
+                    audit_logger.log_event("pin_mismatch", serde_json::Map::from_iter([
+                        ("server_id".to_string(), serde_json::json!(server_cfg.server_id)),
+                        ("tool_name".to_string(), serde_json::json!(t.name)),
+                        ("expected".to_string(), serde_json::json!(expected)),
+                        ("actual".to_string(), serde_json::json!(actual)),
+                    ]));
                     mismatches.push(PinMismatch {
                         server_id: server_cfg.server_id.clone(),
                         tool_name: t.name.clone(),
@@ -197,23 +245,51 @@ async fn main() -> Result<()> {
             // instructions in a tool's own DESCRIPTION, aimed at the agent
             // reading tools/list, without the poisoned tool ever being
             // invoked. Same rule engine, same rules.yaml, different scope —
-            // scan: tool_description rules only fire here. v1 only logs a
-            // warning; it does not withhold the tool or its description
-            // beyond what sanitize_description already does by source
-            // grade below. Escalating this to an actual block on a
-            // high/critical hit is a natural next step, not done yet.
+            // scan: tool_description rules only fire here.
+            //
+            // The scan outcome now has a real consequence, not just a
+            // warning (see F4 in docs/specs/Adversarial Review
+            // magus-opensecmcp.md and sanitize_description below): a
+            // poison-tier hit withholds the description unconditionally; an
+            // elevate/flag-tier hit sanitizes it for forwarding and, under
+            // security_policy.strict_description_scanning, also withholds.
+            // The outcome is cached here (description_hits), keyed
+            // (server_id, tool_name), for handle_tools_list to consult —
+            // it used to be computed and immediately discarded after the
+            // eprintln! below.
             let normalized_desc = rules_engine::normalize_for_matching(&t.description);
             let desc_hits = rule_engine.scan(&normalized_desc, Scope::ToolDescription, &server_cfg.server_id);
             if !desc_hits.is_empty() {
+                let has_poison = desc_hits.hits.iter().any(|h| h.action == rules_engine::Action::Poison);
                 eprintln!(
                     "[MAGUS] WARNING: '{}'/{} tool DESCRIPTION matched {} rule(s), highest severity {:?}: [{}]. \
                      This is registration-time tool poisoning, not a response — the tool has not been called. \
-                     Review the description before trusting this tool.",
+                     {}",
                     server_cfg.server_id,
                     t.name,
                     desc_hits.hits.len(),
                     desc_hits.max_severity().expect("non-empty summary has a max severity"),
-                    desc_hits.rule_ids().join(", ")
+                    desc_hits.rule_ids().join(", "),
+                    if has_poison {
+                        "Poison-tier: description withheld from tools/list unconditionally."
+                    } else {
+                        "Description sanitized for forwarding; withheld too if strict_description_scanning is set."
+                    }
+                );
+                audit_logger.log_event("description_hit", serde_json::Map::from_iter([
+                    ("server_id".to_string(), serde_json::json!(server_cfg.server_id)),
+                    ("tool_name".to_string(), serde_json::json!(t.name)),
+                    ("rule_ids".to_string(), serde_json::json!(desc_hits.rule_ids())),
+                    ("has_poison".to_string(), serde_json::json!(has_poison)),
+                ]));
+                description_hits.insert(
+                    (server_cfg.server_id.clone(), t.name.clone()),
+                    DescriptionHitOutcome { has_poison, rule_ids: desc_hits.rule_ids() },
+                );
+            } else {
+                description_hits.insert(
+                    (server_cfg.server_id.clone(), t.name.clone()),
+                    DescriptionHitOutcome { has_poison: false, rule_ids: Vec::new() },
                 );
             }
 
@@ -231,6 +307,10 @@ async fn main() -> Result<()> {
                          which the MCP spec requires. Conformance checking for this tool may not behave as expected.",
                         server_cfg.server_id, t.name
                     );
+                    audit_logger.log_event("schema_root_not_object", serde_json::Map::from_iter([
+                        ("server_id".to_string(), serde_json::json!(server_cfg.server_id)),
+                        ("tool_name".to_string(), serde_json::json!(t.name)),
+                    ]));
                 }
                 tool_output_schemas.insert(t.name.clone(), schema.clone());
             }
@@ -282,9 +362,8 @@ async fn main() -> Result<()> {
         }
     }
 
-    // ---- Core governance components ----
-    let session_id = Uuid::new_v4().to_string();
-    let audit_logger = Arc::new(AuditLogger::new(&session_id));
+    // ---- Core governance components (session_id/audit_logger now
+    //      constructed earlier, before discovery — see the comment there) ----
     let membrane = Arc::new(Mutex::new(Membrane::new(session_id.clone(), DEFAULT_MAX_AGENTS, DEFAULT_MONTHLY_EVAL_LIMIT)));
     let connection_id = Uuid::new_v4();
     {
@@ -323,7 +402,9 @@ async fn main() -> Result<()> {
         let response = match method {
             "initialize" => Some(handle_initialize(&id)),
             "notifications/initialized" => None, // agent's own handshake notification; nothing to send back
-            "tools/list" => Some(handle_tools_list(&id, &discovered)),
+            "tools/list" => Some(handle_tools_list(
+                &id, &discovered, &description_hits, registry.security_policy.strict_description_scanning,
+            )),
             "tools/call" => Some(handle_tools_call(
                 &id, &json_rpc, &registry, &rule_engine, &tool_owner, &quarantined_tools, &tool_output_schemas, &connections,
                 &membrane, &provenance_tracker, &audit_logger, connection_id,
@@ -364,14 +445,22 @@ fn handle_initialize(id: &serde_json::Value) -> serde_json::Value {
 
 /// Real tool discovery output, merged across every configured downstream
 /// server, with descriptions sanitized according to that server's own
-/// static v1 trust grade. This used to unconditionally return `[]`.
-fn handle_tools_list(id: &serde_json::Value, discovered: &[DiscoveredServer]) -> serde_json::Value {
+/// static v1 trust grade AND, now, that specific tool's own
+/// discovery-time description-scan outcome (see `DescriptionHitOutcome`,
+/// `sanitize_description`). This used to unconditionally return `[]`.
+fn handle_tools_list(
+    id: &serde_json::Value,
+    discovered: &[DiscoveredServer],
+    description_hits: &HashMap<(String, String), DescriptionHitOutcome>,
+    strict_description_scanning: bool,
+) -> serde_json::Value {
     let mut tools = Vec::new();
     for server in discovered {
         for t in &server.tools {
+            let outcome = description_hits.get(&(server.server_id.clone(), t.name.clone()));
             tools.push(serde_json::json!({
                 "name": t.name,
-                "description": sanitize_description(&t.description, server.source_grade),
+                "description": sanitize_description(&t.description, server.source_grade, outcome, strict_description_scanning),
                 "inputSchema": t.input_schema,
             }));
         }
@@ -383,17 +472,102 @@ fn handle_tools_list(id: &serde_json::Value, discovered: &[DiscoveredServer]) ->
     })
 }
 
-/// Attested/Known grades pass descriptions through (stripped of tag-looking
-/// content); Unvalidated/Suspicious get the name and schema but the
-/// description text withheld, since an unreviewed server's prose is the
-/// cheapest place to hide an instruction aimed at the agent, not the human.
-fn sanitize_description(raw: &str, grade: SourceGrade) -> String {
-    match grade {
-        SourceGrade::Attested | SourceGrade::Known => strip_formatting(raw),
-        SourceGrade::Unvalidated | SourceGrade::Suspicious => {
-            format!("[Description withheld - source grade: {:?}. Name and schema only.]", grade)
-        }
+/// Attested/Known grades pass descriptions through `sanitize_for_forwarding`
+/// (safe even on an ordinary description that never had any tag/zero-width
+/// content — deleting nothing is a no-op). Unvalidated/Suspicious get the
+/// name and schema but the description text withheld UNCONDITIONALLY,
+/// regardless of scan outcome, since an unreviewed server's prose is the
+/// cheapest place to hide an instruction aimed at the agent, not the
+/// human — unchanged from before this change.
+///
+/// On top of that existing grade-based gate, a tool-description rule hit
+/// now has its own consequence for Attested/Known descriptions,
+/// independent of source grade (see F4 in `docs/specs/Adversarial Review
+/// magus-opensecmcp.md`): a `poison`-tier hit withholds the description
+/// unconditionally — the same zero-corroboration standard `poison`
+/// already gets everywhere else in this codebase, applied consistently
+/// here rather than as a new, harsher rule. An `elevate`/`flag`-tier hit
+/// is sanitized (which already happens to every Attested/Known
+/// description regardless of hits) and, only when
+/// `security_policy.strict_description_scanning` is set, also withheld.
+///
+/// The withheld message reuses the EXACT shape the Unvalidated/Suspicious
+/// case already uses (`[Description withheld - ...]`, name and schema
+/// still visible, tool still fully callable) — this is NOT SEC-03's
+/// quarantine shape (full removal from `tools/list`). The payload lives
+/// in the prose, not the name or schema, so the response stays scoped to
+/// the prose. The reason clause deliberately does not name which rule(s)
+/// matched or reproduce the matched text — that detail lives in
+/// `audit.jsonl` and the discovery-time `eprintln!`, not in a field
+/// handed back to the same agent whose context this is trying to protect.
+fn sanitize_description(
+    raw: &str,
+    grade: SourceGrade,
+    hit_outcome: Option<&DescriptionHitOutcome>,
+    strict_description_scanning: bool,
+) -> String {
+    if matches!(grade, SourceGrade::Unvalidated | SourceGrade::Suspicious) {
+        return format!("[Description withheld - source grade: {:?}. Name and schema only.]", grade);
     }
+
+    let has_poison = hit_outcome.map(|o| o.has_poison).unwrap_or(false);
+    let has_hit = hit_outcome.map(|o| !o.rule_ids.is_empty()).unwrap_or(false);
+
+    if has_poison {
+        return "[Description withheld - matched a poison-tier detection rule. Name and schema only.]".to_string();
+    }
+    if has_hit && strict_description_scanning {
+        return "[Description withheld - matched a detection rule under strict_description_scanning. \
+                 Name and schema only.]".to_string();
+    }
+
+    sanitize_for_forwarding(raw)
+}
+
+/// Removes content with no legitimate reason to reach a model's context as
+/// part of a tool description. A NEW primitive, distinct in kind from
+/// `rules_engine::normalize_for_matching` — not a reuse of it, and
+/// deliberately not: `normalize_for_matching`'s job is to DECODE
+/// obfuscation back into visible form so a detector can see through it;
+/// reusing that here would be wrong in the opposite direction. A
+/// Tag-block-smuggled instruction, decoded back to plain ASCII and then
+/// forwarded, goes from invisible-but-present to fully readable — worse,
+/// not better. The forwarding-safe operation is DELETE, not decode —
+/// there is no legitimate reason a tool description needs Tag-block
+/// codepoints or zero-width characters to reach a model at all. This
+/// function's job is "what's safe to hand to a model," not "what does
+/// this text actually say" — the opposite of the detection pipeline's
+/// job.
+///
+/// `delete_unicode_tags` is the one genuinely new primitive (a sibling to
+/// `normalize_for_matching`'s `decode_unicode_tags` that removes the
+/// codepoints instead of revealing them). `strip_zero_width` is reused
+/// as-is from the same module — a zero-width character has no legitimate
+/// reason to reach a model either, so the detection-side deletion is
+/// already forwarding-safe. `strip_formatting` is this file's own,
+/// unchanged, pre-existing angle-bracket stripper. Known, pre-existing,
+/// NOT-in-scope-here limitation: `strip_formatting`'s angle-bracket
+/// stripping is a blunt instrument that already mangles legitimate
+/// `<`/`>` content in descriptions — carried forward unchanged, not
+/// something to fix as part of this.
+///
+/// Ordering, traced rather than assumed (`normalize_for_matching` has an
+/// explicit ordering requirement — tag-block decode before whitespace
+/// collapse, since a decoded tag character can itself become a space —
+/// so this composition's own ordering needed the same scrutiny, not a
+/// free pass because it looks similar): `delete_unicode_tags` and
+/// `strip_zero_width` commute freely here, unlike
+/// `normalize_for_matching`'s decode step. Decoding can PRODUCE new
+/// characters (including spaces) that a later step needs to see;
+/// deletion only ever REMOVES characters, so running these two deletions
+/// in either order yields the same result. `strip_formatting` runs last
+/// because it performs its own whitespace normalization as a final
+/// cleanup step, the same reason it's last in behavior even though
+/// nothing upstream of it could reorder unsafely.
+fn sanitize_for_forwarding(raw: &str) -> String {
+    let no_tags = rules_engine::delete_unicode_tags(raw);
+    let no_zero_width = rules_engine::strip_zero_width(&no_tags);
+    strip_formatting(&no_zero_width)
 }
 
 fn strip_formatting(text: &str) -> String {
