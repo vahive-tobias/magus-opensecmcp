@@ -91,8 +91,8 @@ impl RejectionCode {
 /// not reorder this. The two orderings are not equivalent — they diverge on
 /// (Medium, Elevated) and (Low, Contaminated). Tag-first would hard-block
 /// every tagged Medium-risk tool the instant a session reaches Elevated,
-/// which is the normal resting state for any session that has read
-/// anything, not an edge case — the same "security feature gets switched
+/// which is the normal resting state for any session that has consumed
+/// substantial external content, not an edge case — the same "security feature gets switched
 /// off under deadline pressure" failure this project already avoided twice
 /// (the Elevated-vs-Contaminated gating decision in SEC-06, and the
 /// corroboration threshold in the provenance semantics correction).
@@ -108,7 +108,7 @@ pub fn modulate_risk_class(
 ) -> Result<(), &'static str> {
     match (*proposal_risk, *state) {
         (_, ProvenanceState::Clean) => {}
-        (RiskClass::High, ProvenanceState::Elevated) => *proposal_risk = RiskClass::Critical,
+        (_, ProvenanceState::Elevated) => {} // not a signal -- no bump; see docs/specs/spec-c1-provenance-trap-fix.md
         (RiskClass::Medium, ProvenanceState::Contaminated) => *proposal_risk = RiskClass::High,
         (RiskClass::High, ProvenanceState::Contaminated) => *proposal_risk = RiskClass::Critical,
         (_, ProvenanceState::Poisoned) => return Err("InboundPoisoningDetected"),
@@ -677,15 +677,17 @@ mod tests {
     }
 
     #[test]
-    fn high_elevated_bumps_to_critical() {
-        // The bump table takes (High, Elevated) to Critical, but Elevated
-        // != Clean, so the Critical-block gate then fires too — same
-        // shape as (High, Contaminated) below. The risk class still ends
-        // up Critical; the call still errors.
+    fn high_action_at_elevated_is_not_bumped_and_not_blocked() {
+        // Elevated is the normal resting state for a session that has
+        // consumed substantial external content -- it must not, on its
+        // own, escalate a High-risk action to Critical and trip the
+        // Critical gate. This was the C1 provenance-trap bug: Elevated
+        // was structurally unreachable-from, so this row permanently
+        // blocked every High-risk action after the first real response.
         let mut r = RiskClass::High;
         let result = modulate_risk_class(&mut r, &ProvenanceState::Elevated, false);
-        assert_eq!(result, Err("CriticalBlockedByProvenance"), "bumping to Critical under a non-Clean state must then trip the Critical gate");
-        assert_eq!(r, RiskClass::Critical);
+        assert!(result.is_ok(), "Elevated alone must not block a High-risk action, got {:?}", result);
+        assert_eq!(r, RiskClass::High, "Elevated alone must not bump risk class, got {:?}", r);
     }
 
     #[test]
@@ -823,9 +825,14 @@ mod tests {
 
     /// Confirms the tag reuses the EXISTING Critical gate rather than a new
     /// parallel one: a tagged High tool at Elevated hits the state table's
-    /// (High, Elevated) -> Critical arm first, the tag bump is then a no-op
-    /// (already Critical, saturates), and the existing gate fires exactly
-    /// as it would for any other Critical proposal under non-Clean state.
+    /// (_, Elevated) no-op arm first (post-C1-fix, Elevated alone no longer
+    /// bumps risk — see docs/specs/spec-c1-provenance-trap-fix.md), so it's
+    /// the tag bump itself that takes High -> Critical here, and the
+    /// existing gate then fires exactly as it would for any other Critical
+    /// proposal under non-Clean state. Same outcome as before the fix,
+    /// different arm doing the work — this test still exercises "does the
+    /// tag reuse the existing gate," just via the tag bump instead of the
+    /// state table now that the state table doesn't produce Critical here.
     #[test]
     fn tagged_high_at_elevated_is_blocked_by_the_existing_critical_gate() {
         let mut r = RiskClass::High;

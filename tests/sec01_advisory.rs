@@ -103,7 +103,9 @@ fn find_response(responses: &[Value], id: i64) -> &Value {
         .unwrap_or_else(|| panic!("no response with id {id} in: {responses:?}"))
 }
 
-const BENIGN_TEXT: &str = "Standard reply text with nothing unusual in it.";
+// Must match src/bin/fake_advisory_test_server.rs exactly.
+const LONG_BENIGN_TEXT: &str = "Standard reply text with nothing unusual in it. This response is deliberately verbose so the structural response-shape classifier treats it as substantial content rather than a short, trivial reply, which is exactly the condition this fixture exists to exercise.";
+const SHORT_BENIGN_TEXT: &str = "Standard reply text with nothing unusual in it.";
 
 #[test]
 fn tier1_response_gets_advisory_appended_to_structured_content() {
@@ -120,7 +122,7 @@ fn tier1_response_gets_advisory_appended_to_structured_content() {
     // content[] must be untouched -- tier 1 exists precisely to avoid
     // needing to add a content block at all.
     assert_eq!(
-        result["content"][0]["text"], BENIGN_TEXT,
+        result["content"][0]["text"], LONG_BENIGN_TEXT,
         "content[] text must be left exactly as the downstream server returned it"
     );
 
@@ -128,7 +130,7 @@ fn tier1_response_gets_advisory_appended_to_structured_content() {
         .as_str()
         .expect("structuredContent.content must still be a string");
     assert!(
-        structured.starts_with(BENIGN_TEXT),
+        structured.starts_with(LONG_BENIGN_TEXT),
         "original structuredContent.content must survive intact as a prefix, got: {structured:?}"
     );
     assert!(structured.contains("MAGUS ADVISORY"), "got: {structured:?}");
@@ -157,7 +159,7 @@ fn tier2_response_gets_advisory_appended_to_content_block_when_no_structured_con
 
     let text = content_array[0]["text"].as_str().expect("text must still be a string");
     assert!(
-        text.starts_with(BENIGN_TEXT),
+        text.starts_with(LONG_BENIGN_TEXT),
         "original content[].text must survive intact as a prefix, got: {text:?}"
     );
     assert!(text.contains("MAGUS ADVISORY"), "got: {text:?}");
@@ -184,7 +186,42 @@ fn no_further_advisory_once_already_elevated() {
     let second = find_response(&responses, 3);
     let second_structured = second["result"]["structuredContent"]["content"].as_str().unwrap();
     assert_eq!(
-        second_structured, BENIGN_TEXT,
+        second_structured, LONG_BENIGN_TEXT,
         "second call must not escalate further (already Elevated), so no advisory should be injected"
+    );
+}
+
+/// The C1-fix counterpart to the three tests above: a short, benign
+/// response from a Known server must NOT escalate Clean -> Elevated at
+/// all, so no advisory is injected. Before the C1 fix, this was
+/// impossible to assert -- compute_new_state forced Elevated for any
+/// Known-graded BareString/PrimitiveData response regardless of content,
+/// which is exactly what made the three tests above pass on a 49-char
+/// reply and is the bug this fixture and its short/long text split now
+/// exist to keep from silently regressing.
+#[test]
+fn short_benign_response_does_not_escalate_or_get_advisory() {
+    let dir = TempDir::new("tiny");
+    let config = write_config(dir.path());
+
+    let mut lines = handshake_lines();
+    lines.push(tools_call_line(2, "tiny_tool"));
+    let responses = run_gateway(&config, &lines);
+
+    let call = find_response(&responses, 2);
+    let result = &call["result"];
+
+    assert!(
+        result.get("structuredContent").is_none(),
+        "must not introduce a structuredContent key that wasn't already there"
+    );
+
+    let content_array = result["content"].as_array().expect("content must be an array");
+    assert_eq!(content_array.len(), 1, "must not add a new content block");
+
+    let text = content_array[0]["text"].as_str().expect("text must still be a string");
+    assert_eq!(
+        text, SHORT_BENIGN_TEXT,
+        "a short benign response must be forwarded completely untouched -- no advisory, no escalation"
     );
 }

@@ -144,10 +144,16 @@ pub fn classify_response(raw_payload: &[u8]) -> (ResponseForm, u16, u16, u32, St
 
 /// The state machine deciding the new ProvenanceState for an inbound response,
 /// from STRUCTURAL signals only (source grade, response shape, schema
-/// conformance, aggregate size). Mirrors the AS-1-closed match table:
-/// PrimitiveData no longer reaches Clean unconditionally for Attested/Known
-/// grades, and Unvalidated (the v1 default for every server unless
-/// explicitly graded otherwise) never reaches Clean at all.
+/// conformance, aggregate size). For Attested/Known grades, Clean is
+/// reachable whenever the response has no long string content and stays
+/// under the aggregate byte cap — response SHAPE (bare string vs. object)
+/// does not by itself force Elevated; only actual bulk string content
+/// does (this supersedes the earlier AS-1 closed-table approach, which
+/// forced Elevated for BareString/PrimitiveData unconditionally and made
+/// Clean structurally unreachable for ordinary responses — see
+/// docs/specs/spec-c1-provenance-trap-fix.md). Unvalidated (the v1
+/// default for every server unless explicitly graded otherwise) never
+/// reaches Clean at all.
 ///
 /// Pattern-hit-driven state lives in `state_from_rule_hits` below — call
 /// both and take the max. They're kept separate on purpose: this function
@@ -185,15 +191,19 @@ pub fn compute_new_state(
 
     if total_string_bytes > AGGREGATE_STRING_BYTES_CAP { return ProvenanceState::Elevated; }
 
-    match (source_grade, response_form) {
-        (SourceGrade::Attested, ResponseForm::BareString) => ProvenanceState::Elevated,
-        (SourceGrade::Attested, ResponseForm::PrimitiveData) => ProvenanceState::Elevated,
-        (SourceGrade::Known, ResponseForm::BareString) => ProvenanceState::Elevated,
-        (SourceGrade::Known, ResponseForm::PrimitiveData) => ProvenanceState::Elevated,
-        _ => {
-            if long_string_count > 0 { ProvenanceState::Elevated }
-            else { ProvenanceState::Clean }
-        }
+    // Only Attested/Known reach here (the guards above handle the rest).
+    // Elevated is reserved for a structural anomaly that is not itself a
+    // detection — an oversized payload (byte-cap guard above) or a
+    // long-string container (below). "We read something, benign" is NOT
+    // an anomaly and must stay Clean, or Clean becomes unreachable for
+    // every real MCP response (which is always a top-level object ->
+    // PrimitiveData). The cost of having consumed external content, if
+    // any, lives in BP -- the same decision already made for the
+    // Unvalidated surcharge. See docs/specs/spec-c1-provenance-trap-fix.md.
+    if long_string_count > 0 {
+        ProvenanceState::Elevated
+    } else {
+        ProvenanceState::Clean
     }
 }
 
@@ -219,8 +229,8 @@ pub fn compute_new_state(
 /// signal shouldn't fully poison a session on its own (that's what a
 /// `poison` action is for; it's also why the threshold is `>= Contaminated`
 /// rather than `>= Elevated` — `Elevated` is the normal resting state for a
-/// session that has merely read anything, so gating corroboration on it
-/// would let a single ambiguous hit, like the security-blogpost false
+/// session that has consumed substantial external content, so gating
+/// corroboration on it would let a single ambiguous hit, like the security-blogpost false
 /// positive `tests/fixtures/should_not_poison/` covers, poison a session
 /// outright). Two independent heuristic signals, on two different tool
 /// calls or within the same response, should poison. Only the tracker's
@@ -338,25 +348,6 @@ impl AgentProvenanceTracker {
     pub fn record_response_outcome(&mut self, this_call_state: ProvenanceState) {
         if self.current_state == ProvenanceState::Poisoned { return; }
 
-        // Fires even when `this_call_state` isn't strictly greater than
-        // `self.current_state` and therefore wouldn't itself escalate
-        // anything via `ingest_signature` — deliberately reads only
-        // `this_call_state`, never compares it against
-        // `self.current_state`. A fresh signal no worse than the current
-        // state is still evidence the environment isn't clean, and must
-        // still cost the healing progress, not be silently absorbed. This
-        // is the detail that actually closes the loophole a less careful
-        // version of this fix would leave open: without it, an attacker
-        // could interleave sub-threshold noise between clean calls at no
-        // cost while still progressing the streak.
-        if this_call_state > ProvenanceState::Elevated {
-            self.clean_calls_since_elevation = 0;
-            return;
-        }
-
-        // this_call_state <= Elevated: genuinely nothing fired this call.
-        // `Clean` has no lower tier to decay into, so it isn't in this
-        // table — nothing accrues while already at the floor.
         let tier = match self.current_state {
             ProvenanceState::Contaminated => Some((CLEAN_CALLS_TO_DECAY_CONTAMINATED, ProvenanceState::Elevated)),
             ProvenanceState::Elevated => Some((CLEAN_CALLS_TO_DECAY_ELEVATED, ProvenanceState::Clean)),
@@ -364,9 +355,22 @@ impl AgentProvenanceTracker {
         };
 
         if let Some((threshold, next_state)) = tier {
-            self.clean_calls_since_elevation += 1;
-            if self.clean_calls_since_elevation >= threshold {
-                self.current_state = next_state;
+            // A call counts toward decaying into `next_state` only if its
+            // own observed state is no worse than `next_state` itself. Any
+            // call landing ABOVE the target is fresh evidence against
+            // decaying that far -- reset the streak. This is what makes
+            // escalation and decay commute: when the threshold is crossed
+            // and current_state drops to next_state, the same response's
+            // ingest_signature(this_call_state) cannot re-escalate, because
+            // this_call_state <= next_state by the very condition that let
+            // it count.
+            if this_call_state <= next_state {
+                self.clean_calls_since_elevation += 1;
+                if self.clean_calls_since_elevation >= threshold {
+                    self.current_state = next_state;
+                    self.clean_calls_since_elevation = 0;
+                }
+            } else {
                 self.clean_calls_since_elevation = 0;
             }
         }
@@ -484,27 +488,27 @@ mod tests {
     }
 
     #[test]
-    fn as1_closed_table_attested_bare_string_is_elevated_never_clean() {
+    fn attested_bare_string_reaches_clean_without_long_string_content() {
         let state = compute_new_state(SourceGrade::Attested, ResponseForm::BareString, SchemaConformance::NotDeclared, 0, 0);
-        assert_eq!(state, ProvenanceState::Elevated);
+        assert_eq!(state, ProvenanceState::Clean, "a short response must not be trapped at Elevated purely for being a bare string");
     }
 
     #[test]
-    fn as1_closed_table_attested_primitive_data_is_elevated_never_clean() {
+    fn attested_primitive_data_reaches_clean_without_long_string_content() {
         let state = compute_new_state(SourceGrade::Attested, ResponseForm::PrimitiveData, SchemaConformance::NotDeclared, 0, 0);
-        assert_eq!(state, ProvenanceState::Elevated);
+        assert_eq!(state, ProvenanceState::Clean, "a short response must not be trapped at Elevated purely for being primitive data");
     }
 
     #[test]
-    fn as1_closed_table_known_bare_string_is_elevated_never_clean() {
+    fn known_bare_string_reaches_clean_without_long_string_content() {
         let state = compute_new_state(SourceGrade::Known, ResponseForm::BareString, SchemaConformance::NotDeclared, 0, 0);
-        assert_eq!(state, ProvenanceState::Elevated);
+        assert_eq!(state, ProvenanceState::Clean, "a short response must not be trapped at Elevated purely for being a bare string");
     }
 
     #[test]
-    fn as1_closed_table_known_primitive_data_is_elevated_never_clean() {
+    fn known_primitive_data_reaches_clean_without_long_string_content() {
         let state = compute_new_state(SourceGrade::Known, ResponseForm::PrimitiveData, SchemaConformance::NotDeclared, 0, 0);
-        assert_eq!(state, ProvenanceState::Elevated);
+        assert_eq!(state, ProvenanceState::Clean, "a short response must not be trapped at Elevated purely for being primitive data");
     }
 
     #[test]
@@ -557,7 +561,7 @@ mod tests {
     /// THE regression guard for this change. A single heuristic hit must
     /// land on Contaminated — heuristic, uncorroborated, recoverable — even
     /// when the session is already Elevated (the normal resting state for
-    /// any session that has merely read something). If this collapses back
+    /// any session that has consumed substantial external content). If this collapses back
     /// to Poisoned, the corroboration threshold silently reverted to
     /// `>= Elevated`, and a single DSO-001 match — including the
     /// security-blogpost false positive
@@ -572,7 +576,7 @@ mod tests {
             state_from_rule_hits(&summary, ProvenanceState::Elevated),
             ProvenanceState::Contaminated,
             "a single heuristic hit from Elevated must land on Contaminated, NOT Poisoned — \
-             Elevated is the normal resting state for any session that has read anything, so \
+             Elevated is the normal resting state for any session that has consumed substantial external content, so \
              corroborating against it would poison on a single ambiguous signal"
         );
     }
@@ -869,5 +873,48 @@ mod tests {
         );
         tracker.record_response_outcome(ProvenanceState::Clean);
         assert_eq!(tracker.current_state, ProvenanceState::Elevated, "must decay once the full K is reached AFTER the reset");
+    }
+
+    /// The C1 regression guard. Unlike every other decay test above, this
+    /// one drives `this_call_state` from the REAL classifier
+    /// (`compute_new_state`) on a real response shape, and chains it
+    /// through both tracker methods in main.rs's own order -- not a
+    /// hand-picked ProvenanceState literal fed to record_response_outcome
+    /// alone. This is the specific coverage hole that let the C1
+    /// provenance-trap bug ship: every prior decay test could pass against
+    /// a classifier that structurally never produced Clean for any real
+    /// response, because none of them ever asked the classifier what it
+    /// would actually produce.
+    #[test]
+    fn decay_driven_by_real_classify_and_chained_like_main_rs_reaches_clean() {
+        let mut tracker = AgentProvenanceTracker::new();
+        tracker.current_state = ProvenanceState::Elevated;
+
+        // A short, benign response from a Known server -- e.g. a "pong"
+        // reply -- classifies as PrimitiveData (top-level object), zero
+        // long strings, well under the byte cap.
+        let this_call_state = compute_new_state(
+            SourceGrade::Known,
+            ResponseForm::PrimitiveData,
+            SchemaConformance::NotDeclared,
+            4,
+            0,
+        );
+        assert_eq!(
+            this_call_state,
+            ProvenanceState::Clean,
+            "precondition: a short real response must classify as Clean post-fix, or the rest of this test is meaningless"
+        );
+
+        for _ in 0..CLEAN_CALLS_TO_DECAY_ELEVATED {
+            tracker.record_response_outcome(this_call_state);
+            tracker.ingest_signature(this_call_state, "known-server", &[]);
+        }
+
+        assert_eq!(
+            tracker.current_state,
+            ProvenanceState::Clean,
+            "K consecutive real-classifier-produced Clean responses, chained through both tracker methods in main.rs's actual order, must decay Elevated back to Clean"
+        );
     }
 }

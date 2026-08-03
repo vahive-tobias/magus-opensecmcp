@@ -57,7 +57,7 @@ package, not simulated:
   to produce identical flag-only output; they don't anymore.
 - The provenance state machine and risk-evaluation engine (`provenance.rs`,
   `membrane.rs`) — the oldest and most security-critical code in this
-  repo — now have direct unit test coverage (56 tests) instead of only
+  repo — now have direct unit test coverage (57 tests) instead of only
   ever having been checked by hand. Covers the full source-grade/
   response-shape classification table, the rule-hit corroboration logic
   (a second heuristic signal while already `Contaminated` escalates to

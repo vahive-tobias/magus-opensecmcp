@@ -56,7 +56,7 @@ generalized into the classification logic; see the comment at that check in
 middle two states is the one worth understanding precisely: `Clean` — no
 external influence observed. `Elevated` — external content was consumed,
 but nothing was detected; this is the normal resting state for a routine
-call against a graded server, not itself a signal. `Contaminated` —
+call that returns substantial content against a graded server, not itself a signal. `Contaminated` —
 heuristic evidence fired: a rule hit, uncorroborated, recoverable.
 `Poisoned` — either a deterministic contract breach (a declared
 `outputSchema` violated, or a response that didn't even parse) or
