@@ -28,6 +28,16 @@ fn default_discovery_timeout_seconds() -> f64 {
     DEFAULT_DISCOVERY_TIMEOUT_SECONDS
 }
 
+/// M4 (see `docs/specs/ADVERSARIAL_REVIEW_OPUS.md`): `strict_schema_pinning`
+/// defaults to `true`, not `false`. A bare `#[serde(default)]` on a `bool`
+/// field yields `false`, which is exactly the warn-only-by-default posture
+/// this fix removes — see the field's own doc comment for why enforcement
+/// is now the default and what stays a no-op for a config that never pins
+/// anything.
+fn default_strict_schema_pinning() -> bool {
+    true
+}
+
 /// Shared by both the global `security_policy` defaults and every
 /// per-entry `timeout_seconds`/`discovery_timeout_seconds` override:
 /// zero, negative, NaN, and infinite are all rejected, not just zero.
@@ -82,22 +92,35 @@ pub enum SourceGrade {
 }
 
 /// Optional, top-level policy for how a discovery-time hash-pin mismatch is
-/// handled. Absent entirely from `config.yaml` (or every field omitted)
-/// deserializes to all-`false`, which is today's warn-only behavior,
-/// unchanged — see `pin_policy.rs` and
+/// handled. Absent entirely from `config.yaml` (or `strict_schema_pinning`
+/// specifically omitted) now means hash-pin ENFORCEMENT is on — the M4 fix
+/// (see `docs/specs/ADVERSARIAL_REVIEW_OPUS.md`) flips the historical
+/// warn-only default. Every OTHER field here still deserializes to `false`
+/// when omitted, unchanged — see `pin_policy.rs` and
 /// `docs/specs/spec-sec03-hash-pin-enforcement.md`.
 #[derive(Debug, Clone, Copy, Deserialize)]
 pub struct SecurityPolicy {
-    #[serde(default)]
+    /// `true` by default (see `default_strict_schema_pinning` and this
+    /// struct's own doc comment) — a discovery-time hash-pin mismatch
+    /// quarantines the affected tool unless this is explicitly set to
+    /// `false`. A config with no pins configured at all is completely
+    /// unaffected regardless of this flag's value: `pin_policy::decide_quarantine`
+    /// only fires on `PinStatus::Mismatched`, never on `NotYetPinned`, at
+    /// any strictness.
+    #[serde(default = "default_strict_schema_pinning")]
     pub strict_schema_pinning: bool,
     #[serde(default)]
     pub refuse_startup_on_pin_mismatch: bool,
     /// Escalates an elevate/flag-tier tool-description rule hit (from an
     /// Attested/Known-graded server) from sanitize-and-warn to full
-    /// withholding — same shape as `strict_schema_pinning`, `false` by
-    /// default (today's behavior, unchanged). A poison-tier description
-    /// hit withholds unconditionally regardless of this flag; see
-    /// `main.rs`'s `sanitize_description`.
+    /// withholding. `false` by default — unlike `strict_schema_pinning`,
+    /// this one is NOT on by default: no named, disclosed CVE class is
+    /// staked on tool-description scanning the way hash-pinning is staked
+    /// on `CVE-2025-54136`/`CVE-2025-54135` (see `THREAT_MODEL.md`), so
+    /// there's no equivalent live-documentation-inaccuracy pressure to
+    /// flip this one too. A poison-tier description hit withholds
+    /// unconditionally regardless of this flag; see `main.rs`'s
+    /// `sanitize_description`.
     #[serde(default)]
     pub strict_description_scanning: bool,
     /// Escalates a discovered bare-tool-name collision (F3 — see
@@ -145,20 +168,24 @@ pub struct SecurityPolicy {
 }
 
 impl Default for SecurityPolicy {
-    /// NOT derived, deliberately: `default_tool_timeout_seconds`/
-    /// `default_discovery_timeout_seconds` need to land on the same
-    /// non-zero policy defaults here as their `#[serde(default = ...)]`
-    /// functions produce for a `config.yaml` that omits `security_policy:`
-    /// entirely — a derived `Default` would silently give both `0.0`
-    /// instead (a `bool`-shaped assumption baked into `#[derive(Default)]`
-    /// that stopped holding the moment this struct grew numeric fields),
-    /// which `pin_policy::validate_policy`'s new zero-timeout check would
-    /// then reject for every caller that builds a `SecurityPolicy` via
-    /// `..Default::default()` — including this file's own pre-existing
-    /// test helpers, none of which are testing timeout behavior at all.
+    /// NOT derived, deliberately, for two independent reasons now:
+    /// `default_tool_timeout_seconds`/`default_discovery_timeout_seconds`
+    /// need to land on the same non-zero policy defaults here as their
+    /// `#[serde(default = ...)]` functions produce for a `config.yaml`
+    /// that omits `security_policy:` entirely — a derived `Default` would
+    /// silently give both `0.0` instead, which
+    /// `pin_policy::validate_policy`'s zero-timeout check would then
+    /// reject for every caller that builds a `SecurityPolicy` via
+    /// `..Default::default()`. And, as of M4, `strict_schema_pinning`
+    /// itself is `true` here, not the `false` `#[derive(Default)]` would
+    /// give every `bool` field uniformly — this struct no longer has a
+    /// single "all fields false/zero" derived shape at all, on two
+    /// separate axes, which is exactly why this impl has to stay
+    /// hand-written and kept in sync with each field's own
+    /// `#[serde(default = ...)]` rather than re-derived.
     fn default() -> Self {
         SecurityPolicy {
-            strict_schema_pinning: false,
+            strict_schema_pinning: true,
             refuse_startup_on_pin_mismatch: false,
             strict_description_scanning: false,
             refuse_startup_on_tool_name_collision: false,
@@ -351,5 +378,53 @@ impl ToolRegistry {
 
     pub fn server_config(&self, server_id: &str) -> Option<&DownstreamServerConfig> {
         self.servers.iter().find(|s| s.server_id == server_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// M4 (see docs/specs/ADVERSARIAL_REVIEW_OPUS.md): the Rust-level
+    /// Default must land on `true`, matching `default_strict_schema_pinning`
+    /// used for the serde path — this is the guard against the two paths
+    /// silently diverging again, the same risk the `impl Default` doc
+    /// comment above already names.
+    #[test]
+    fn security_policy_default_has_strict_schema_pinning_true() {
+        assert!(
+            SecurityPolicy::default().strict_schema_pinning,
+            "SecurityPolicy::default() must have strict_schema_pinning: true"
+        );
+    }
+
+    /// The OTHER path: a real config.yaml, loaded through the real
+    /// deserializer, with `security_policy:` omitted entirely — not just
+    /// constructing a `SecurityPolicy` directly in Rust. `#[serde(default =
+    /// ...)]` and `impl Default` are independent mechanisms that can
+    /// diverge; this is deliberately a separate test from the one above
+    /// rather than assumed to be covered by it.
+    #[test]
+    fn config_omitting_security_policy_block_defaults_strict_schema_pinning_true() {
+        let dir = std::env::temp_dir().join(format!("magus-registry-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("failed to create temp test dir");
+        let config_path = dir.join("config.yaml");
+        std::fs::write(
+            &config_path,
+            "downstream_servers:\n\
+             \x20\x20- server_id: \"fake\"\n\
+             \x20\x20\x20\x20transport: \"stdio\"\n\
+             \x20\x20\x20\x20command: \"true\"\n\
+             \x20\x20\x20\x20args: []\n",
+        )
+        .expect("failed to write temp config.yaml");
+
+        let registry = ToolRegistry::load_from_yaml(&config_path).expect("config with no security_policy: block must load");
+        assert!(
+            registry.security_policy.strict_schema_pinning,
+            "a config.yaml that omits security_policy: entirely must default strict_schema_pinning to true"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -8,8 +8,10 @@
 # package (`npx -y @modelcontextprotocol/server-filesystem`), captured by the
 # gateway's own startup log, not typed from memory. move_file's pin below is
 # deliberately wrong by one character, on purpose, left in so that on your
-# first run you SEE the mismatch warning fire for real instead of taking the
-# hash-pinning feature on faith. Fix it once you've watched it catch it.
+# first run you SEE real enforcement fire instead of taking the hash-pinning
+# feature on faith: strict_schema_pinning defaults to true, so move_file
+# comes up quarantined (absent from tools/list, rejected if called by name)
+# until you fix the pin. Fix it once you've watched it catch it.
 #
 # Detection rules live separately now, in locked-rules.yaml (shipped inside
 # the binary) and optionally user-rules.yaml (create it next to this file --

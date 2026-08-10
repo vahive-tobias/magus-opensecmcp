@@ -29,8 +29,10 @@ package, not simulated:
 - `tools/call` forwards approved calls and returns the server's real response.
 - Every tool definition is hash-pinned at discovery; `config.yaml` ships with
   the real hashes captured from a real run, and one of them (`move_file`) is
-  deliberately off by one character so your first run shows you the mismatch
-  warning firing for real, not just described in a comment.
+  deliberately off by one character so your first run shows real enforcement
+  firing, not just described in a comment: `move_file` is quarantined —
+  absent from `tools/list`, rejected if called by name — until you fix the
+  pin.
 - The taint-tracking demo works end to end: reading a file with an injection
   attempt in it gets approved (reading is low-risk), but the *next* call
   even an identical, previously-successful read gets blocked, because the
@@ -73,14 +75,21 @@ package, not simulated:
   response, or a declared `outputSchema` that was violated) — the latter
   has no false-positive class, so it never needs corroboration. See
   `THREAT_MODEL.md` for the full reasoning.
-- A confirmed hash-pin mismatch can now actually be enforced, not just
-  logged. `security_policy.strict_schema_pinning: true` quarantines the
+- A confirmed hash-pin mismatch is enforced by default now, not just
+  logged. `security_policy.strict_schema_pinning` quarantines the
   specific mismatched tool — absent from `tools/list`, a distinct
   rejection if called by name anyway — without taking the rest of the
-  gateway down. A stronger `refuse_startup_on_pin_mismatch: true` opt-in
-  refuses the whole gateway to start, with a distinct exit code for
-  script/CI detection. Both default off; an existing `config.yaml` is
-  completely unaffected.
+  gateway down, and it's `true` unless you set it to `false`. A stronger
+  `refuse_startup_on_pin_mismatch: true` opt-in refuses the whole gateway
+  to start instead, with a distinct exit code for script/CI detection;
+  it still requires `strict_schema_pinning` to be on, which the default
+  now satisfies — `refuse_startup_on_pin_mismatch: true` alone is enough,
+  the flag itself is still opt-in either way.
+  This IS a behavior change for an existing `config.yaml` that pins real
+  hashes — a tool whose definition has since drifted from its pin, which
+  used to just warn, now gets quarantined on upgrade. A `config.yaml`
+  that doesn't pin anything is completely unaffected either way: no pin
+  means nothing to mismatch, at any strictness setting.
 - When a response causes a genuine state escalation, the gateway now
   appends a plainly-labeled advisory into the response itself instead of
   silently changing state while forwarding the original content
@@ -344,6 +353,43 @@ works it's auto-registered at a `Medium` ceiling (`bootstrap: true` in the
 audit log), never silently trusted at `Low` and never silently blocked
 outright, so an unclassified tool doesn't break your agent on day one, but is
 visibly flagged for you to go classify properly.
+
+## Hash-pin maintenance
+
+`security_policy.strict_schema_pinning` is on by default, which means a
+pinned tool's definition genuinely has to keep matching its pin — and
+that has a real, ongoing operational cost worth naming explicitly rather
+than leaving you to discover it.
+
+The quickstart above launches the downstream server with `npx -y
+@modelcontextprotocol/server-filesystem`, which resolves to whatever is
+currently published on every launch. The next time that package ships
+*any* change to a pinned tool's definition — a description typo fix, a
+new optional parameter, nothing malicious at all — that tool's computed
+hash no longer matches its pin, and by default it's quarantined: gone
+from `tools/list`, rejected if called by name. There's no chat-visible
+signal for this. The warning goes to the gateway's own stderr, and where
+your specific MCP client routes a spawned subprocess's stderr is between
+you and that client — stdout is reserved for JSON-RPC framing here, so a
+warning can only ever go to stderr, but whether your client surfaces
+that anywhere you'd see it isn't something this project controls or has
+verified either way. From the agent's side, a tool it had a moment ago
+is just gone.
+
+Three ways to handle this, none of them more "correct" than the others:
+
+- **Re-pin.** The new hash is right there in the startup log (or run
+  `magus-gateway config.yaml --discovery-report`) — copy it into
+  `pinned_definition_hash_hex` once you've confirmed the change is
+  legitimate.
+- **Stop tracking latest.** Point `command`/`args` at a fixed version of
+  the downstream package instead of an always-`-y`-latest invocation, so
+  the definition only changes when you decide to move.
+- **Turn strictness off.** Set `security_policy.strict_schema_pinning:
+  false` to go back to warn-only — a mismatch gets logged, the tool
+  keeps working. This is a legitimate, ordinary choice for a workflow
+  that would rather not deal with re-pinning churn, not a discouraged
+  fallback.
 
 ## Downstream timeouts
 

@@ -206,6 +206,48 @@ fn strict_true_with_wrong_pin_quarantines_the_tool() {
     );
 }
 
+/// M4 (see docs/specs/ADVERSARIAL_REVIEW_OPUS.md): the default itself,
+/// exercised end to end — no `security_policy:` block in the config at
+/// all, relying entirely on `strict_schema_pinning` defaulting to `true`.
+/// Every other test in this file declares the flag explicitly one way or
+/// the other; before this test, the actual default path had never been
+/// driven through the compiled binary.
+#[test]
+fn wrong_pin_with_no_security_policy_block_quarantines_the_tool_by_default() {
+    let dir = TempDir::new("default_wrong_pin");
+    let tools_block = format!(
+        "tools:\n\
+         \x20\x20- mcp_server_id: \"fake\"\n\
+         \x20\x20\x20\x20tool_name: \"ping\"\n\
+         \x20\x20\x20\x20risk_class: \"Low\"\n\
+         \x20\x20\x20\x20authority_source: \"User\"\n\
+         \x20\x20\x20\x20pinned_definition_hash_hex: \"{}\"\n",
+        wrong_pin_hex()
+    );
+    let config = write_config(dir.path(), &tools_block, "");
+
+    let output = run_gateway(&config, &jsonrpc_lines());
+    assert!(
+        output.status.success(),
+        "strict-by-default quarantine on one tool must not take the whole gateway down, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let responses = parse_responses(&output.stdout);
+    let names = tool_names(find_response(&responses, 2));
+    assert!(
+        !names.contains(&"ping".to_string()),
+        "a quarantined tool must be absent from tools/list with NO security_policy: block present, got: {names:?}"
+    );
+
+    let call = find_response(&responses, 3);
+    let error = call.get("error").expect("a direct call to a quarantined tool must be rejected by default");
+    assert_eq!(
+        error["data"]["magus_rejection_code"], "ToolQuarantinedPinMismatch",
+        "must be the distinct quarantine code, not a generic one: {error:?}"
+    );
+}
+
 #[test]
 fn wrong_pin_without_strict_mode_tool_remains_callable() {
     let dir = TempDir::new("nonstrict_wrong_pin");
