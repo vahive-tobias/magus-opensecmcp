@@ -353,6 +353,219 @@ mod tests {
         }
     }
 
+    // ── Verdict-steerability enumeration ──────────────────────────────────
+    //
+    // Adapted from the uniqueness property developed for VKC Mini, where a
+    // deterministic membrane admitted two valid commands for one input and so
+    // handed the choice — and therefore the authority — to a learned
+    // component. This membrane has no learned component, so the question
+    // takes its stateful form: the agent does not choose among verdicts, but
+    // it does choose the PATH, and a verdict reachable by more than one path
+    // is a verdict the agent has some say in.
+    //
+    // The dimensions are split by who controls them:
+    //
+    //   agent-influenced   provenance state (which servers it calls, what
+    //                      comes back), accumulated BP (call ordering),
+    //                      external_content_influence (whether it reads
+    //                      external material first)
+    //   operator-declared  communicates_externally (config.yaml),
+    //                      source_grade (registry)
+    //
+    // Steerability along the agent-influenced axes is not by itself a defect —
+    // a risk budget is meant to be path-dependent. What must hold is that
+    // every axis moves in ONE direction: degrading the session's information
+    // environment may restrict, never unlock. These tests assert that
+    // monotonicity, which is the property that would actually be a hole if it
+    // failed, and which no per-rule review would surface.
+
+    const ALL_STATES: [ProvenanceState; 4] = [
+        ProvenanceState::Clean,
+        ProvenanceState::Elevated,
+        ProvenanceState::Contaminated,
+        ProvenanceState::Poisoned,
+    ];
+
+    const ALL_RISKS: [RiskClass; 4] = [
+        RiskClass::Low,
+        RiskClass::Medium,
+        RiskClass::High,
+        RiskClass::Critical,
+    ];
+
+    /// Evaluate one action in one agent-influenced configuration, on a fresh
+    /// session each time so the accumulator does not carry between points.
+    fn verdict_at(
+        risk: RiskClass,
+        state: ProvenanceState,
+        external_influence: bool,
+        grade: SourceGrade,
+        externally_communicating: bool,
+        authority: AuthoritySource,
+    ) -> Result<(), RejectionCode> {
+        let mut membrane = make_membrane(3, 5000);
+        let connection_id = Uuid::new_v4();
+        membrane.register_agent(connection_id).unwrap();
+        let mut tracker = AgentProvenanceTracker::new();
+        tracker.current_state = state;
+        let audit = AuditLogger::new_with_path(temp_audit_path(), "test-session");
+
+        let mut proposal = make_proposal("prop-enum", risk, authority, external_influence);
+        proposal.source_grade = grade;
+        proposal.communicates_externally = externally_communicating;
+
+        membrane.evaluate(&proposal, connection_id, &mut tracker, &audit)
+    }
+
+    #[test]
+    fn degrading_provenance_never_unlocks_an_action() {
+        // Clean is the most permissive information environment. Nothing the
+        // agent can do to degrade it may turn a refusal into an approval.
+        for risk in ALL_RISKS {
+            for influence in [false, true] {
+                for grade in [SourceGrade::Known, SourceGrade::Unvalidated] {
+                    for external in [false, true] {
+                        let clean = verdict_at(
+                            risk, ProvenanceState::Clean, influence, grade, external,
+                            AuthoritySource::User,
+                        );
+                        if clean.is_ok() {
+                            continue; // allowed at Clean: degradation may restrict it, fine
+                        }
+                        for state in ALL_STATES {
+                            let degraded = verdict_at(
+                                risk, state, influence, grade, external,
+                                AuthoritySource::User,
+                            );
+                            assert!(
+                                degraded.is_err(),
+                                "monotonicity violated: {risk:?} refused at Clean but ALLOWED at \
+                                 {state:?} (influence={influence}, grade={grade:?}, external={external})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn external_content_influence_never_makes_an_action_more_permissive() {
+        for risk in ALL_RISKS {
+            for state in ALL_STATES {
+                for grade in [SourceGrade::Known, SourceGrade::Unvalidated] {
+                    let without = verdict_at(risk, state, false, grade, false, AuthoritySource::User);
+                    let with = verdict_at(risk, state, true, grade, false, AuthoritySource::User);
+                    if without.is_err() {
+                        assert!(
+                            with.is_err(),
+                            "surcharge inverted: {risk:?}/{state:?}/{grade:?} refused WITHOUT \
+                             external influence but allowed WITH it"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unvalidated_source_never_makes_an_action_more_permissive() {
+        for risk in ALL_RISKS {
+            for state in ALL_STATES {
+                for influence in [false, true] {
+                    let known = verdict_at(risk, state, influence, SourceGrade::Known, false, AuthoritySource::User);
+                    let unvalidated =
+                        verdict_at(risk, state, influence, SourceGrade::Unvalidated, false, AuthoritySource::User);
+                    if known.is_err() {
+                        assert!(
+                            unvalidated.is_err(),
+                            "surcharge inverted: {risk:?}/{state:?} refused for a Known source \
+                             but allowed for an Unvalidated one"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_capability_tag_never_makes_an_action_more_permissive() {
+        // communicates_externally is operator-declared, not agent-controlled,
+        // so this is not a steerability check — it verifies the OP-3 bump
+        // cannot invert, which would silently reward tagging a tool.
+        for risk in ALL_RISKS {
+            for state in ALL_STATES {
+                let untagged = verdict_at(risk, state, false, SourceGrade::Known, false, AuthoritySource::User);
+                let tagged = verdict_at(risk, state, false, SourceGrade::Known, true, AuthoritySource::User);
+                if untagged.is_err() {
+                    assert!(
+                        tagged.is_err(),
+                        "OP-3 bump inverted: {risk:?}/{state:?} refused untagged but allowed when \
+                         tagged communicates_externally"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn enumerate_the_agent_steerable_surface() {
+        // Prints the boundary map: for each action shape, the most degraded
+        // provenance state at which it is still allowed. "Is any verdict
+        // different somewhere?" is not a useful question here — Poisoned
+        // refuses everything by design, so every shape would trivially answer
+        // yes. The informative quantity is WHERE each shape's boundary sits.
+        // Run with `cargo test enumerate_the_agent_steerable_surface -- --nocapture`.
+        eprintln!(
+            "\n=== last provenance state at which each action shape is still allowed ===\n\
+             (influence = external_content_influence; '-' means refused even at Clean)\n"
+        );
+        eprintln!("   {:<34} {:<12} {:<12}", "action shape", "influence=no", "influence=yes");
+
+        for risk in ALL_RISKS {
+            for grade in [SourceGrade::Known, SourceGrade::Unvalidated] {
+                for external in [false, true] {
+                    let boundary = |influence: bool| -> String {
+                        let mut last = None;
+                        for state in ALL_STATES {
+                            if verdict_at(risk, state, influence, grade, external, AuthoritySource::User).is_ok() {
+                                last = Some(state);
+                            }
+                        }
+                        match last {
+                            Some(s) => format!("{s:?}"),
+                            None => "-".to_string(),
+                        }
+                    };
+                    eprintln!(
+                        "   {:<34} {:<12} {:<12}",
+                        format!("{risk:?}/{grade:?}/ext={external}"),
+                        boundary(false),
+                        boundary(true)
+                    );
+                }
+            }
+        }
+        eprintln!();
+
+        // The one thing that must hold regardless: a Critical action must
+        // never be allowed anywhere the session is not Clean.
+        for grade in [SourceGrade::Known, SourceGrade::Unvalidated] {
+            for influence in [false, true] {
+                for state in ALL_STATES {
+                    if state == ProvenanceState::Clean {
+                        continue;
+                    }
+                    assert!(
+                        verdict_at(RiskClass::Critical, state, influence, grade, false, AuthoritySource::User)
+                            .is_err(),
+                        "Critical allowed at {state:?} (grade={grade:?}, influence={influence})"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn replay_detection_second_call_with_same_id_is_rejected() {
         let mut membrane = make_membrane(3, 5000);

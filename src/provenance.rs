@@ -396,6 +396,239 @@ mod tests {
         }
     }
 
+    // ── Evidence monotonicity ─────────────────────────────────────────────
+    //
+    // The dilution question: can ADDING a rule hit ever lower the state
+    // `state_from_rule_hits` returns? If it could, an attacker would pad a
+    // real signal with extra benign-looking triggers to wash it out. Reading
+    // the function says no, because every input to the decision is a
+    // set-membership or a count and both only grow. Enumerated anyway --
+    // "reading it says no" is what was true of the VKC Mini binding rule.
+
+    #[test]
+    fn adding_a_hit_never_lowers_the_resulting_state() {
+        let catalogue = [
+            hit("r-low", "cat-a", Severity::Low, Action::Flag),
+            hit("r-med-a", "cat-a", Severity::Medium, Action::Flag),
+            hit("r-med-b", "cat-b", Severity::Medium, Action::Flag),
+            hit("r-med-c", "cat-c", Severity::Medium, Action::Flag),
+            hit("r-high", "cat-d", Severity::High, Action::Elevate),
+            hit("r-poison", "cat-e", Severity::High, Action::Poison),
+        ];
+
+        // Every subset of the catalogue, against every starting state.
+        for mask in 0u32..(1 << catalogue.len()) {
+            let subset: Vec<HitDetail> = (0..catalogue.len())
+                .filter(|i| mask & (1 << i) != 0)
+                .map(|i| catalogue[i].clone())
+                .collect();
+
+            for current in [
+                ProvenanceState::Clean,
+                ProvenanceState::Elevated,
+                ProvenanceState::Contaminated,
+                ProvenanceState::Poisoned,
+            ] {
+                let base = state_from_rule_hits(&RuleHitSummary { hits: subset.clone() }, current);
+
+                // Adding any one further hit must not reduce the outcome.
+                for (i, extra) in catalogue.iter().enumerate() {
+                    if mask & (1 << i) != 0 {
+                        continue;
+                    }
+                    let mut grown = subset.clone();
+                    grown.push(extra.clone());
+                    let after = state_from_rule_hits(&RuleHitSummary { hits: grown }, current);
+                    assert!(
+                        after >= base,
+                        "adding {} lowered {base:?} -> {after:?} (current={current:?}, subset={:?})",
+                        extra.rule_id,
+                        subset.iter().map(|h| &h.rule_id).collect::<Vec<_>>()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_poison_hit_dominates_every_other_combination() {
+        let poison = hit("r-poison", "cat-e", Severity::High, Action::Poison);
+        let padding = [
+            hit("p1", "cat-a", Severity::Low, Action::Flag),
+            hit("p2", "cat-b", Severity::Low, Action::Flag),
+            hit("p3", "cat-c", Severity::Medium, Action::Flag),
+        ];
+        for mask in 0u32..(1 << padding.len()) {
+            let mut hits = vec![poison.clone()];
+            for (i, p) in padding.iter().enumerate() {
+                if mask & (1 << i) != 0 {
+                    hits.push(p.clone());
+                }
+            }
+            for current in [ProvenanceState::Clean, ProvenanceState::Contaminated] {
+                assert_eq!(
+                    state_from_rule_hits(&RuleHitSummary { hits: hits.clone() }, current),
+                    ProvenanceState::Poisoned,
+                    "poison did not dominate with padding mask {mask:b}"
+                );
+            }
+        }
+    }
+
+    // ── Reachable-state enumeration ───────────────────────────────────────
+    //
+    // Second application of the property developed for VKC Mini. The membrane
+    // asked "how many verdicts are reachable"; the FSM asks the temporal form
+    // of the same question: over every observation sequence the agent could
+    // produce, which states are reachable, and can any of them be reached in a
+    // direction the design forbids?
+    //
+    // The observation alphabet is exhaustive — the four per-call states are
+    // everything a single response can be worth — so sequences up to length N
+    // cover the whole behaviour space up to that depth, rather than sampling it.
+
+    const ALPHABET: [ProvenanceState; 4] = [
+        ProvenanceState::Clean,
+        ProvenanceState::Elevated,
+        ProvenanceState::Contaminated,
+        ProvenanceState::Poisoned,
+    ];
+
+    /// Drive a tracker through one sequence, applying both halves of the
+    /// per-response update in the order main.rs uses them.
+    fn drive(seq: &[ProvenanceState]) -> AgentProvenanceTracker {
+        let mut tracker = AgentProvenanceTracker::new();
+        for observed in seq {
+            tracker.ingest_signature(*observed, "server-x", &[]);
+            tracker.record_response_outcome(*observed);
+        }
+        tracker
+    }
+
+    fn all_sequences(depth: usize) -> Vec<Vec<ProvenanceState>> {
+        let mut out = vec![Vec::new()];
+        for _ in 0..depth {
+            let mut next = Vec::new();
+            for prefix in &out {
+                for observed in ALPHABET {
+                    let mut extended = prefix.clone();
+                    extended.push(observed);
+                    next.push(extended);
+                }
+            }
+            out.extend(next);
+        }
+        out
+    }
+
+    #[test]
+    fn poisoned_is_absorbing_across_every_sequence_to_depth_six() {
+        // 4^1..4^6 = 5,460 sequences. Once Poisoned is observed, no suffix of
+        // any composition may return the tracker to anything else.
+        let mut checked = 0usize;
+        for seq in all_sequences(6) {
+            if !seq.contains(&ProvenanceState::Poisoned) {
+                continue;
+            }
+            let tracker = drive(&seq);
+            assert_eq!(
+                tracker.current_state,
+                ProvenanceState::Poisoned,
+                "sequence {seq:?} contained Poisoned but ended at {:?}",
+                tracker.current_state
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "enumeration produced no Poisoned-containing sequences");
+    }
+
+    #[test]
+    fn no_single_observation_lowers_the_state_except_by_completing_a_decay_streak() {
+        // The one-step version of monotonicity: from any state, an observation
+        // may raise the state, hold it, or lower it by exactly one tier -- and
+        // lowering requires the streak to be at its threshold. Anything that
+        // dropped two tiers at once, or dropped from a fresh streak, would be a
+        // laundering shortcut.
+        for start in ALPHABET {
+            for observed in ALPHABET {
+                let mut tracker = AgentProvenanceTracker::new();
+                tracker.current_state = start;
+                tracker.clean_calls_since_elevation = 0;
+
+                tracker.ingest_signature(observed, "server-x", &[]);
+                tracker.record_response_outcome(observed);
+
+                assert!(
+                    tracker.current_state >= start || start == ProvenanceState::Clean,
+                    "single observation {observed:?} lowered {start:?} -> {:?} from a fresh streak",
+                    tracker.current_state
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn escalation_and_healing_are_mutually_exclusive_for_one_response() {
+        // The doc comment on record_response_outcome claims this holds "by
+        // construction, not by coincidence". Enumerated rather than trusted.
+        for start in [ProvenanceState::Elevated, ProvenanceState::Contaminated] {
+            for observed in ALPHABET {
+                let mut tracker = AgentProvenanceTracker::new();
+                tracker.current_state = start;
+                // Streak one short of the threshold, so a qualifying call decays.
+                tracker.clean_calls_since_elevation = match start {
+                    ProvenanceState::Contaminated => CLEAN_CALLS_TO_DECAY_CONTAMINATED - 1,
+                    _ => CLEAN_CALLS_TO_DECAY_ELEVATED - 1,
+                };
+
+                tracker.ingest_signature(observed, "server-x", &[]);
+                let after_escalation = tracker.current_state;
+                tracker.record_response_outcome(observed);
+                let after_decay = tracker.current_state;
+
+                let escalated = after_escalation > start;
+                let healed = after_decay < after_escalation;
+                assert!(
+                    !(escalated && healed),
+                    "observation {observed:?} from {start:?} both escalated ({after_escalation:?}) \
+                     and healed ({after_decay:?}) on the same response"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn enumerate_reachable_states_and_the_cost_of_reaching_clean() {
+        // Prints the reachable set and the shortest laundering path, so the
+        // bound the F1 doc comment states in prose is a measured number.
+        // `cargo test enumerate_reachable_states -- --nocapture`
+        let mut shortest_back_to_clean: Option<usize> = None;
+        for seq in all_sequences(9) {
+            if !seq.contains(&ProvenanceState::Contaminated) || seq.contains(&ProvenanceState::Poisoned) {
+                continue;
+            }
+            if drive(&seq).current_state == ProvenanceState::Clean {
+                let len = seq.len();
+                shortest_back_to_clean = Some(shortest_back_to_clean.map_or(len, |b| b.min(len)));
+            }
+        }
+
+        eprintln!("\n=== provenance reachability ===");
+        eprintln!(
+            "   shortest observation sequence from a Contaminated signal back to Clean: {}",
+            shortest_back_to_clean
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "unreachable within depth 9".to_string())
+        );
+        eprintln!("   Poisoned -> anything else: unreachable (asserted above)\n");
+
+        // Whatever the number is, it must exceed a single clean call --
+        // otherwise one boring response would undo a real signal.
+        if let Some(n) = shortest_back_to_clean {
+            assert!(n > CLEAN_CALLS_TO_DECAY_ELEVATED as usize, "laundering path too short: {n}");
+        }
+    }
+
     // ---- compute_new_state ----
 
     #[test]
