@@ -1,0 +1,25 @@
+// scheduler.rs — ordinary Rust, no attack content whatsoever.
+// "inst" is used here purely as an abbreviation for "instance"/"index",
+// the way it commonly appears in real codebases — not as any reference
+// to a model control token.
+
+struct TaskQueue {
+    tasks: Vec<u32>,
+}
+
+fn run_task(tasks: &[u32], inst: usize) -> u32 {
+    tasks[inst]
+}
+
+fn swap_tasks(table: &mut [u32], inst: usize, other: usize) {
+    table.swap(inst, other);
+}
+
+fn main() {
+    let tasks = vec![10, 20, 30, 40];
+    let inst = 2;
+    println!("task at index {} is {}", inst, run_task(&tasks, inst));
+
+    let mut table = vec![1, 2, 3];
+    swap_tasks(&mut table, inst, 0);
+}

@@ -111,9 +111,9 @@ fn write_config(dir: &Path, strict_description_scanning: bool, user_rules: Optio
 }
 
 /// A rule with no locked-rules.yaml equivalent today: elevate-tier,
-/// tool_description-scoped. Needed because every current locked
-/// description-eligible rule (MCT-*, scope: any) is poison-tier — see
-/// fake_desc_test_server.rs's module comment.
+/// tool_description-scoped. Needed because no locked rule combines
+/// action: elevate with a description-eligible scope (any or
+/// tool_description) — see fake_desc_test_server.rs's module comment.
 fn elevate_tier_description_rule() -> String {
     format!(
         "rules:\n\
@@ -123,6 +123,36 @@ fn elevate_tier_description_rule() -> String {
          \x20\x20\x20\x20match: {{ type: literal, pattern: \"{FLAGGED_MARKER}\" }}\n\
          \x20\x20\x20\x20scope: tool_description\n\
          \x20\x20\x20\x20action: elevate\n"
+    )
+}
+
+/// Same shape as `elevate_tier_description_rule` above, `action: poison`
+/// instead. Needed for the same reason, sharpened by the H2 retier
+/// (locked-rules.yaml's model_control_token category comment): MCT-001–004
+/// were the only `scope: any` rules with `action: poison`, and downgrading
+/// them to `elevate` leaves EXF-001 as the sole remaining poison-tier
+/// rule — `scope: tool_output_only`, which `rule_applies` in
+/// rules_engine.rs makes structurally impossible to satisfy against a
+/// `Scope::ToolDescription` scan, regardless of payload content. No
+/// locked rule can exercise F4's withholding branch for descriptions at
+/// all anymore, hence this synthetic one.
+///
+/// Deliberately NOT added to locked-rules.yaml itself. The withholding
+/// posture is already covered three ways — `strict_description_scanning`,
+/// the `Unvalidated`/`Suspicious` grade withholding, and an
+/// operator-authored `user-rules.yaml` rule like this one — and a
+/// SHIPPED rule that withholds a description unconditionally is exactly
+/// the disproportionate posture the retier removed; reintroducing it here
+/// would undo the fix this file's other tests exist to verify.
+fn poison_tier_description_rule() -> String {
+    format!(
+        "rules:\n\
+         \x20\x20- id: TEST-DESC-POISON-001\n\
+         \x20\x20\x20\x20category: test\n\
+         \x20\x20\x20\x20severity: critical\n\
+         \x20\x20\x20\x20match: {{ type: literal, pattern: \"{FLAGGED_MARKER}\" }}\n\
+         \x20\x20\x20\x20scope: tool_description\n\
+         \x20\x20\x20\x20action: poison\n"
     )
 }
 
@@ -193,21 +223,35 @@ fn tool_names(tools_list_response: &Value) -> Vec<String> {
         .collect()
 }
 
-/// THE required regression test: a Known-graded server's tool description
-/// carries a genuine Tag-block-smuggled MCT-001 marker ("<|im_start|>",
-/// spelled entirely in Tag-block codepoints, decoded only by
-/// normalize_for_matching's detection-side pass). Asserted against the
-/// ACTUAL tools/list response text — not sanitize_description called
-/// directly — that the payload is absent in BOTH forms: the raw
-/// Tag-block bytes (never decoded for forwarding) and the decoded plain
-/// ASCII (never revealed either, since the whole description is withheld
-/// on a poison-tier hit). Before this fix, sanitize_description called
-/// strip_formatting alone, which has nothing to do with Tag-block
-/// handling at all — the smuggled marker would have reached this exact
-/// response field, in the decoded, fully readable form, because
-/// strip_formatting's angle-bracket-only stripping is not tag-block-aware.
+/// Renamed from `poison_tier_smuggled_payload_is_absent_from_the_real_response_in_any_form`.
+/// MCT-001 was `poison`-tier when this test was written; the H2 retier
+/// (see docs/specs/ADVERSARIAL_REVIEW_OPUS.md and locked-rules.yaml's
+/// model_control_token category comment) moved it to `elevate` — a raw
+/// ChatML marker has a real false-positive class (tokenizer configs,
+/// prompt-format docs), so it no longer withholds unconditionally. This
+/// test now covers the SANITIZE path, not withholding: a Known-graded
+/// server's tool description carries a genuine Tag-block-smuggled MCT-001
+/// marker ("<|im_start|>", spelled entirely in Tag-block codepoints,
+/// decoded only by normalize_for_matching's detection-side pass).
+/// Asserted against the ACTUAL tools/list response text — not
+/// sanitize_description called directly — that the payload is absent in
+/// BOTH forms: the raw Tag-block bytes (deleted outright by
+/// delete_unicode_tags, never decoded for forwarding) and the decoded
+/// plain ASCII (never appears either, since deletion happens before any
+/// decode-and-reveal step could produce it) — while the rest of the
+/// description still reaches the agent, sanitized rather than withheld.
+///
+/// EXF-001 is now the only `poison`-tier rule in locked-rules.yaml, and
+/// its `scope: tool_output_only` makes it structurally impossible to
+/// fire on a description scan (`Scope::ToolDescription`) at all — see
+/// `rule_applies` in rules_engine.rs. No locked rule can exercise F4's
+/// withholding branch for descriptions anymore; that gap is intentionally
+/// not closed here — flagged for a separate decision, not files in this
+/// commit, since it needs a synthetic user-rules.yaml poison rule the
+/// same way `elevate_tier_description_rule` below already does for the
+/// elevate/flag case.
 #[test]
-fn poison_tier_smuggled_payload_is_absent_from_the_real_response_in_any_form() {
+fn mct_001_hit_sanitizes_tag_block_payload_but_does_not_withhold_by_default() {
     let dir = TempDir::new("poison");
     let config = write_config(dir.path(), false, None);
 
@@ -225,21 +269,60 @@ fn poison_tier_smuggled_payload_is_absent_from_the_real_response_in_any_form() {
     );
     assert!(
         !desc.contains("<|im_start|>"),
-        "the DECODED payload must not reach the response either — poison withholds the whole \
-         description, it does not forward a cleaned-but-revealed version, got: {desc:?}"
+        "the DECODED payload must not reach the response either — sanitize_for_forwarding \
+         deletes Tag-block codepoints outright, it does not decode and reveal them, got: {desc:?}"
+    );
+    assert!(
+        !desc.contains("withheld"),
+        "an elevate-tier hit in non-strict mode must sanitize, not withhold, got: {desc:?}"
+    );
+    assert!(
+        desc.starts_with("A perfectly normal-looking tool description."),
+        "the rest of the description must still reach the response, sanitized rather than \
+         removed entirely, got: {desc:?}"
+    );
+
+    let names = tool_names(tools_list);
+    assert!(names.contains(&"poison_tool".to_string()), "the tool itself must still appear in tools/list, got: {names:?}");
+    let call = find_response(&responses, 3);
+    assert!(call.get("error").is_none(), "a sanitized description hit must not block the tool from being called, got: {call:?}");
+}
+
+/// F4's withholding branch, restored: the poison-path counterpart to
+/// `mct_001_hit_sanitizes_tag_block_payload_but_does_not_withhold_by_default`
+/// above. Reuses `flagged_tool`'s existing zero-width-fragmented marker
+/// description — the SAME payload the elevate scenario below exercises —
+/// with `poison_tier_description_rule`'s synthetic rule injected instead
+/// of the elevate one, so the only variable between this test and
+/// `elevate_tier_hit_sanitizes_but_does_not_withhold_by_default` is which
+/// rule matched, not which payload was sent. `strict_description_scanning`
+/// is left false here deliberately: a poison-tier hit withholds
+/// unconditionally, regardless of that flag — if this test needed
+/// `strict_description_scanning: true` to pass, that would itself be a
+/// regression back toward treating poison and elevate the same way.
+#[test]
+fn poison_tier_user_rule_hit_withholds_the_description_unconditionally() {
+    let dir = TempDir::new("poison_user_rule");
+    let config = write_config(dir.path(), false, Some(&poison_tier_description_rule()));
+
+    let output = run_gateway(&config, &jsonrpc_lines(None));
+    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+
+    let responses = parse_responses(&output.stdout);
+    let tools_list = find_response(&responses, 2);
+    let desc = tool_description(tools_list, "flagged_tool");
+
+    assert!(
+        !desc.contains(FLAGGED_MARKER),
+        "the marker text must not reach the response at all under a poison-tier hit, got: {desc:?}"
     );
     assert!(
         desc.contains("withheld"),
         "expected the withholding message for a poison-tier description hit, got: {desc:?}"
     );
 
-    // Name and schema still visible, tool still fully callable — this is
-    // the existing Unvalidated/Suspicious withholding shape, NOT SEC-03's
-    // quarantine shape (full removal from tools/list).
     let names = tool_names(tools_list);
-    assert!(names.contains(&"poison_tool".to_string()), "the tool itself must still appear in tools/list, got: {names:?}");
-    let call = find_response(&responses, 3);
-    assert!(call.get("error").is_none(), "a poison-tier description hit must not block the tool from being called, got: {call:?}");
+    assert!(names.contains(&"flagged_tool".to_string()), "the tool itself must still appear in tools/list, got: {names:?}");
 }
 
 /// Elevate/flag-tier hit, non-strict (the default): sanitized for

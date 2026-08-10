@@ -16,8 +16,8 @@
 //   should_be_silent/  zero rule hits, full stop.
 //   should_not_poison/ hits allowed, including an `elevate`-action hit;
 //                       state_from_rule_hits (starting from Clean) must
-//                       stay at Clean or Elevated — only Poisoned fails
-//                       this tier. `elevate` exists specifically to tighten
+//                       stay at Clean, Elevated, or Contaminated — only
+//                       Poisoned fails this tier. `elevate` exists specifically to tighten
 //                       a session on one ambiguous signal without
 //                       condemning it outright; Poisoned requires either a
 //                       critical hit or a second, independent corroborating
@@ -111,8 +111,8 @@ fn should_not_poison_never_reaches_poisoned() {
             state,
             ProvenanceState::Poisoned,
             "fixture 'should_not_poison/{}' escalated provenance all the way to \
-             Poisoned (rule hit(s): [{}]) — this tier permits Clean or Elevated \
-             but must never reach Poisoned",
+             Poisoned (rule hit(s): [{}]) — this tier permits Clean, Elevated, or \
+             Contaminated but must never reach Poisoned",
             name,
             hits.rule_ids().join(", ")
         );

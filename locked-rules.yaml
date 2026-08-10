@@ -75,9 +75,12 @@ rules:
     notes: "Persona-override framing. Lower confidence alone than DSO-001/002, so flag-only unless corroborated by another category."
 
   # ── model_control_token ───────────────────────────────────────────────
-  # Raw chat-template turn markers. Essentially zero legitimate reason to
-  # appear as literal text in filesystem/git/web-scraper tool output, so
-  # these are critical/poison with no false-positive tuning.
+  # Raw chat-template turn markers. High-signal, but NOT evidence free of a
+  # false-positive class: tokenizer configs and prompt-format documentation
+  # contain them legitimately as data. They are therefore `elevate` —
+  # heuristic evidence, corroboration required to reach Poisoned — matching
+  # the heuristic/deterministic split THREAT_MODEL.md defines. Severity
+  # stays critical so a genuine hit keeps full corroboration weight.
   - id: MCT-001
     category: model_control_token
     severity: critical
@@ -85,8 +88,8 @@ rules:
       type: literal
       pattern: "<|im_start|>"
     scope: any
-    action: poison
-    notes: "ChatML role-turn open marker."
+    action: elevate
+    notes: "ChatML role-turn open marker. Appears legitimately in tokenizer_config.json chat_template fields."
 
   - id: MCT-002
     category: model_control_token
@@ -95,18 +98,19 @@ rules:
       type: literal
       pattern: "<|im_end|>"
     scope: any
-    action: poison
-    notes: "ChatML role-turn close marker."
+    action: elevate
+    notes: "ChatML role-turn close marker. Appears legitimately in tokenizer_config.json chat_template fields."
 
   - id: MCT-003
     category: model_control_token
     severity: critical
     match:
-      type: literal
-      pattern: "[INST]"
+      type: regex
+      pattern: '\[INST\]'
     scope: any
-    action: poison
-    notes: "Llama-family instruction marker."
+    action: elevate
+    case_sensitive: true
+    notes: "Llama-family instruction marker. Case-sensitive regex rather than a literal: literals are matched case-insensitively, which collided with ordinary code indexing."
 
   - id: MCT-004
     category: model_control_token
@@ -115,8 +119,8 @@ rules:
       type: literal
       pattern: "<<SYS>>"
     scope: any
-    action: poison
-    notes: "Llama-family system-turn marker."
+    action: elevate
+    notes: "Llama-family system-turn marker. Appears legitimately in prompt-format documentation and examples."
 
   # ── secret_exfiltration ────────────────────────────────────────────────
   - id: EXF-001
