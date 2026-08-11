@@ -391,6 +391,14 @@ Three ways to handle this, none of them more "correct" than the others:
   that would rather not deal with re-pinning churn, not a discouraged
   fallback.
 
+For the record: the definition-hash algorithm itself changed once, to
+close a real collision between where a tool's `name` ends and its
+`description` begins (see `hasher.rs`). Every pin captured before that change no longer matches a definition
+hashed after it — this is a one-time event tied to that specific fix,
+not something that recurs. If you pinned anything before upgrading past
+it, re-pin the same way as above: from the startup log, or
+`--discovery-report`.
+
 ## Downstream timeouts
 
 Both halves of the downstream connection — the discovery handshake

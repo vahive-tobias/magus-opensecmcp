@@ -79,11 +79,24 @@ fn hash_canonical_value(value: &serde_json::Value, hasher: &mut Hasher, depth: u
 
 /// Computes the deterministic 32-byte hash for a given MCP tool definition.
 /// Computed the moment the gateway first sees a definition, and re-verified on
-/// every subsequent tools/list poll — see main.rs discover_tools().
+/// every subsequent tools/list poll — see main.rs discover_tools(). `name` and
+/// `description` follow the same length-prefixing discipline as every value
+/// inside `hash_canonical_value` below — see the comment at their two
+/// `hasher.update()` calls for why that wasn't always true.
 pub fn compute_definition_hash(tool: &McpToolDefinition) -> [u8; 32] {
     let mut hasher = Hasher::new();
 
+    // Length-prefixed: without a prefix, these two fields concatenate
+    // ambiguously, so name="read"/description="_file..." and
+    // name="read_"/description="file..." would hash identically. No type
+    // tag, deliberately, unlike hash_canonical_value's values: a tag earns
+    // its place there because that stream can carry any JSON type at a
+    // given position; name/description are always `String` by this
+    // struct's own type, so there's no type ambiguity for a tag to
+    // resolve. Scope decision, not left unfinished.
+    hasher.update(&(tool.name.len() as u64).to_le_bytes());
     hasher.update(tool.name.as_bytes());
+    hasher.update(&(tool.description.len() as u64).to_le_bytes());
     hasher.update(tool.description.as_bytes());
 
     hash_canonical_value(&tool.input_schema, &mut hasher, 0);
@@ -161,6 +174,37 @@ mod tests {
             compute_definition_hash(&tool_a),
             compute_definition_hash(&tool_b),
             "Length-prefixing must prevent concatenation collisions"
+        );
+    }
+
+    /// `test_collision_resistance` above only shifts the boundary INSIDE
+    /// the schema, where `hash_canonical_value` already length-prefixed
+    /// every value — it validated the property exactly where it already
+    /// held, never where it didn't. This is the case that actually
+    /// collided: the name/description boundary, hashed as bare
+    /// concatenated bytes with no prefix at all before this fix.
+    #[test]
+    fn name_description_boundary_does_not_collide() {
+        let tool_a = McpToolDefinition {
+            name: "read".to_string(),
+            description: "_file contents from disk".to_string(),
+            input_schema: json!({}),
+            output_schema: None,
+        };
+
+        let tool_b = McpToolDefinition {
+            name: "read_".to_string(),
+            description: "file contents from disk".to_string(),
+            input_schema: json!({}),
+            output_schema: None,
+        };
+
+        assert_ne!(
+            compute_definition_hash(&tool_a),
+            compute_definition_hash(&tool_b),
+            "name/description must be length-prefixed so where the name ends and the \
+             description begins is unambiguous, the same discipline hash_canonical_value \
+             already applies to every value it hashes"
         );
     }
 
