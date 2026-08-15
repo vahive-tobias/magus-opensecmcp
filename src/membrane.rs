@@ -56,7 +56,6 @@ pub enum RejectionCode {
     AgentLimitReached,
     InboundPoisoningDetected,
     CriticalBlockedByProvenance,
-    EvaluationLimitReached,
 }
 
 impl RejectionCode {
@@ -70,7 +69,6 @@ impl RejectionCode {
             RejectionCode::AgentLimitReached => "AgentLimitReached",
             RejectionCode::InboundPoisoningDetected => "InboundPoisoningDetected",
             RejectionCode::CriticalBlockedByProvenance => "CriticalBlockedByProvenance",
-            RejectionCode::EvaluationLimitReached => "EvaluationLimitReached",
         }
     }
 }
@@ -151,6 +149,10 @@ impl Membrane {
 
     pub fn register_agent(&mut self, connection_id: Uuid) -> Result<(), RejectionCode> {
         if self.agent_accumulators.len() >= self.max_agents {
+            // Not audited via record_rejection: this fires before any
+            // Proposal exists, and this function has no tracker/audit
+            // parameters to log one with -- structurally excluded, not
+            // an oversight.
             return Err(RejectionCode::AgentLimitReached);
         }
         self.agent_accumulators.insert(connection_id, SESSION_INIT_BP);
@@ -169,10 +171,25 @@ impl Membrane {
         tracker: &mut AgentProvenanceTracker,
         audit: &AuditLogger,
     ) -> Result<(), RejectionCode> {
-        if self.quota.is_over_limit() {
-            return Err(RejectionCode::EvaluationLimitReached);
+        // Soft-warn, not hard-lock -- see quota.rs's module comment. The
+        // count is recorded unconditionally and nothing below gates on it.
+        // A one-time notice fires on the exact call that crosses the
+        // limit, not on every call after -- this is a usage counter, not
+        // an enforcement mechanism.
+        let eval_count = self.quota.record_and_get_count();
+        if eval_count == self.quota.limit() {
+            let limit = self.quota.limit();
+            eprintln!(
+                "[MAGUS] NOTICE: this session has recorded {eval_count} tool-call evaluations \
+                 this calendar month, crossing the {limit}-evaluation usage counter. This is a \
+                 notice, not a limit -- nothing is blocked and no further action is required. \
+                 The counter resets on the next calendar month or on gateway restart.",
+            );
+            audit.log_event("quota_threshold_reached", serde_json::Map::from_iter([
+                ("count".to_string(), serde_json::json!(eval_count)),
+                ("limit".to_string(), serde_json::json!(limit)),
+            ]));
         }
-        self.quota.record_and_get_count();
 
         if self.executed_proposals.len() >= MAX_NONCE_CACHE {
             self.record_rejection(proposal, connection_id, tracker, audit, RejectionCode::SessionExhausted, 0);
@@ -180,6 +197,7 @@ impl Membrane {
         }
 
         if self.executed_proposals.contains(&proposal.id) {
+            self.record_rejection(proposal, connection_id, tracker, audit, RejectionCode::ReplayDetected, 0);
             return Err(RejectionCode::ReplayDetected);
         }
 
@@ -584,22 +602,44 @@ mod tests {
     }
 
     #[test]
-    fn quota_exceeded_rejects_even_an_otherwise_approvable_proposal() {
-        // monthly_eval_limit = 1: the first call consumes the quota; the
-        // second, even though otherwise fully approvable on its own merits,
-        // must be rejected purely on quota grounds.
+    fn quota_crossing_does_not_reject_the_crossing_call_or_any_call_after() {
+        // monthly_eval_limit = 1: the first call crosses the threshold
+        // (count == limit). L9's fix makes this a notice, not a gate --
+        // the crossing call and every call after it must still be
+        // evaluated on their own merits, never rejected for quota alone.
         let mut membrane = make_membrane(3, 1);
         let connection_id = Uuid::new_v4();
         membrane.register_agent(connection_id).unwrap();
         let mut tracker = AgentProvenanceTracker::new();
-        let audit = AuditLogger::new_with_path(temp_audit_path(), "test-session");
+        let path = temp_audit_path();
+        let audit = AuditLogger::new_with_path(path.clone(), "test-session");
 
         let p1 = make_proposal("prop-1", RiskClass::Low, AuthoritySource::User, false);
         assert!(membrane.evaluate(&p1, connection_id, &mut tracker, &audit).is_ok());
 
         let p2 = make_proposal("prop-2", RiskClass::Low, AuthoritySource::User, false);
         let result = membrane.evaluate(&p2, connection_id, &mut tracker, &audit);
-        assert_eq!(result, Err(RejectionCode::EvaluationLimitReached));
+        assert!(result.is_ok(), "the counter must not gate anything, got {result:?}");
+
+        let p3 = make_proposal("prop-3", RiskClass::Low, AuthoritySource::User, false);
+        let result = membrane.evaluate(&p3, connection_id, &mut tracker, &audit);
+        assert!(result.is_ok(), "the counter must not gate anything, got {result:?}");
+
+        let contents = std::fs::read_to_string(&path).expect("audit log file must exist and be readable");
+        let lines: Vec<serde_json::Value> = contents
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("each audit line must be valid JSON"))
+            .collect();
+        let threshold_events: Vec<&serde_json::Value> = lines.iter()
+            .filter(|r| r["event"] == "quota_threshold_reached")
+            .collect();
+        // Fire-once is the whole point of the design -- two more calls
+        // happen past the crossing point (p2, p3) specifically so a
+        // regression that re-fires on every call past the limit produces
+        // a visible count here instead of passing on p2 alone.
+        assert_eq!(threshold_events.len(), 1, "notice must fire exactly once, not on every call past the limit");
+        assert_eq!(threshold_events[0]["count"], 1);
+        assert_eq!(threshold_events[0]["limit"], 1);
     }
 
     /// §5's retirement, asserted directly: a User-authority proposal with

@@ -152,6 +152,15 @@ already stated below for `risk_class` itself. Only one tag exists
 (`communicates_externally`) — deliberately, not a capability taxonomy; see
 that field's own documentation in README for why.
 
+Stated more sharply: this is a rate limit, and a rate limit is the wrong
+shape of defense against a single-shot, irreversible action. Exfiltration
+succeeds in exactly one call. Measured directly against the running budget
+math: the tag's surcharge cuts the number of approved calls available
+before the risk floor ends the session from roughly 34 to roughly 8 — a
+real reduction, but an attacker who needs only one call is unaffected by
+whether 8 or 34 remained. Raising the cost of repetition does not
+constrain an action that doesn't repeat.
+
 **Config that tries to weaken itself.** `user-rules.yaml`'s action grammar
 has no `allow`/`bypass` value — a rule that tries to weaken enforcement
 fails to parse rather than needing to be specially detected and rejected.
@@ -221,6 +230,20 @@ this proxy doesn't mediate, this tool has no visibility into it at all.
 instructions.** This watches tool call requests and responses. It has no
 opinion on, and no visibility into, why the agent decided to make a
 particular call in the first place.
+
+**A response that triggers detection is still forwarded to the model in
+full.** The gate is post-hoc, not pre-hoc: a tool response is scanned and
+forwarded to the model verbatim, with an advisory appended where delivery
+allows — see `advisory.rs` — never withheld or stripped, no matter what it
+triggers. Only the session's *next* action is gated by whatever provenance
+state that response produced. If an injected instruction's damage is done
+purely by the model reading and acting on it — through its own reasoning,
+or through a channel this proxy doesn't mediate — the gateway does not
+prevent that. This is different from tool *descriptions*, which a
+poison-tier match does withhold before the agent ever sees them (see
+"Instruction smuggling via a tool's own description" above) — the two are
+not the same mechanism, and a response's content is never withheld the
+way a description can be.
 
 **Detection completeness.** Stated plainly rather than implied: the
 six-category signature taxonomy, the deliberately narrow normalization

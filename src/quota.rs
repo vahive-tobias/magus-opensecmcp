@@ -5,10 +5,15 @@
 // and cannot be silently bypassed by a firewall the way a remote check
 // could be.
 //
-// v1 has a single usage limit and no license concept — this simply exists
-// so the number is visible and the behavior (soft-warn, not hard-lock) is
-// decided deliberately rather than left as an accidental permanent
-// lockout.
+// v1 has a single usage limit and no license concept, and the behavior is
+// soft-warn, not hard-lock, deliberately: `membrane::evaluate` calls
+// `record_and_get_count` unconditionally and never gates on it. The caller
+// emits one notice (eprintln! + an audit event) the instant the count
+// crosses `limit`, then does nothing further — later calls aren't checked
+// against it again. This counter is pure in-memory atomics with no
+// persistence, so it's cleared by either a real calendar-month rollover
+// (`record_and_get_count`'s own reset) or simply by the process
+// restarting; it exists so the number is visible, not to enforce it.
 
 use chrono::{Datelike, Utc};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -41,15 +46,6 @@ impl QuotaCounter {
         self.count_this_period.fetch_add(1, Ordering::Relaxed) + 1
     }
 
-    pub fn is_over_limit(&self) -> bool {
-        let now_period = period_key();
-        if now_period != self.current_period.load(Ordering::Relaxed) {
-            return false; // new period hasn't been recorded into yet
-        }
-        self.count_this_period.load(Ordering::Relaxed) >= self.limit
-    }
-
-    #[allow(dead_code)]
     pub fn limit(&self) -> u32 {
         self.limit
     }

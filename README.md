@@ -399,6 +399,25 @@ not something that recurs. If you pinned anything before upgrading past
 it, re-pin the same way as above: from the startup log, or
 `--discovery-report`.
 
+## Audit log
+
+`~/.magus/audit.jsonl` is append-only with no rotation and no size cap,
+at a single fixed path shared by every session and every gateway process
+on the machine — managing it (rotating, archiving, trimming) is the
+operator's job, not something this tool does for you.
+
+Roughly 500 bytes per evaluation record — measured directly against a
+real log, not estimated; two independent samples came in around 460 and
+510 bytes, and the exact figure drifts with things like how many rule
+IDs a given call triggered. At 1,000 evaluations/day that's on the order
+of 150–200 MB/year. (The log's own whole-file average understates this
+by about half, since one-time startup events — `session_start`,
+`discovery_summary`, pin warnings — fire once per process, not once per
+evaluation, and pull the mean down; the per-evaluation figure above is
+the one that actually predicts long-run growth.) Real, but modest for
+most usage — plan around it if you leave a gateway running unattended
+for a long time.
+
 ## Downstream timeouts
 
 Both halves of the downstream connection — the discovery handshake
