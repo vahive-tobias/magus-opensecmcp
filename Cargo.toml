@@ -48,3 +48,10 @@ blake3 = "=1.5.4"
 getrandom = "=0.2.15"
 uuid = { version = "=1.10.0", features = ["v4"] }
 indexmap = "=2.2.6"
+
+# Same exact-pin treatment and reason as the block above: an exact pin
+# can't drift past a version requiring a newer edition no matter what
+# happens to Cargo.lock. Resolved tree at pin time: unicode-script 0.5.8,
+# tinyvec 1.12.0, tinyvec_macros 0.1.1 -- all edition 2018.
+unicode-normalization = "=0.1.25"
+unicode-security = "=0.1.2"

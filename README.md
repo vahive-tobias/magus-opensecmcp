@@ -143,10 +143,14 @@ package, not simulated:
   re-hanging on every subsequent call.
 
 What isn't done yet: dynamic (learned) server trust grading, a packaged
-binary release, and the fuller normalization pipeline (NFKC/confusables
-skeletonization, base64-peel-and-rescan) that `rules_engine.rs`
-deliberately stops short of for now — see that file's module comment for
-exactly what's in v1 versus noted as follow-up. Multi-server tool
+binary release, and a base64/hex decode-and-rescan peel that
+`rules_engine.rs` deliberately stops short of for now — see that file's
+`fold_confusables` and `normalize_for_matching` comments for exactly
+what's in v1 versus noted as follow-up (NFKC and TR39 confusable
+skeletonization, the other two items formerly in this omissions list, are
+now implemented — a single Unicode confusable substitution, e.g. Cyrillic
+'о' for Latin 'o', is folded to a common form before matching rather than
+silently evading every rule). Multi-server tool
 resolution itself is built and tested (see above); the shipped
 `config.yaml` demo still only configures one server — see
 [Roadmap](#roadmap).
@@ -540,10 +544,15 @@ not merged like documentation. Contributions welcome — see below.
       still not done.
 - [ ] More registry packs (GitHub, Postgres, Slack) verified against the
       real server before merge, per the contribution rule above.
-- [ ] Fuller normalization pipeline in `rules_engine.rs` — NFKC, TR39
-      confusables/homoglyph skeletonization, and a depth-capped
-      base64/hex decode-and-rescan peel. v1 covers case-folding, whitespace
-      collapse, zero-width stripping, and Unicode Tag-block decode only.
+- [x] NFKC and TR39 confusables/homoglyph skeletonization in
+      `rules_engine.rs` — DONE: a single Unicode confusable substitution
+      (e.g. Cyrillic 'о' for Latin 'o') is folded to a common form before
+      matching, closing mechanical character-substitution evasion of the
+      entire signature taxonomy. Still open: a depth-capped base64/hex
+      decode-and-rescan peel, and paraphrase evasion, which a signature
+      layer cannot close by construction — see `fold_confusables`'s own
+      comment in `rules_engine.rs` for exactly what this does and doesn't
+      claim.
 - [x] Entropy-based escalation for secret-shaped rules — DONE for both
       `SECRET-AWS-001` and `SECRET-GH-001`: a real leaked key/token and
       each provider's own documented placeholder example no longer
