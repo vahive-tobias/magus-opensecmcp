@@ -96,9 +96,8 @@ impl RejectionCode {
 /// corroboration threshold in the provenance semantics correction).
 /// Tag-after instead modifies an already-state-adjusted risk: the state
 /// table answers how degraded the session's information environment is;
-/// the tag answers how consequential this particular action is. See
-/// docs/specs/spec-op3-capability-tag.md for the full 16-cell table and
-/// worked reasoning.
+/// the tag answers how consequential this particular action is
+/// (docs/specs/spec-op3-capability-tag.md).
 pub fn modulate_risk_class(
     proposal_risk: &mut RiskClass,
     state: &ProvenanceState,

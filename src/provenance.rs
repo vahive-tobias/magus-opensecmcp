@@ -25,9 +25,8 @@ pub enum ResponseForm {
 }
 
 /// The 4-tier provenance state of an agent's information environment. Each
-/// state carries exactly one meaning — see
-/// docs/specs/spec-provenance-semantics-correction.md for the full
-/// rationale:
+/// state carries exactly one meaning
+/// (docs/specs/spec-provenance-semantics-correction.md):
 ///
 ///   - `Clean`        — no external influence observed.
 ///   - `Elevated`     — external content was consumed. No detection fired.
@@ -328,9 +327,12 @@ impl AgentProvenanceTracker {
     }
 
     /// Decay driven by verified-clean ROUND TRIPS, not agent-declared
-    /// egress size — see `docs/specs/spec-f1-clean-call-decay.md` for why
-    /// the byte-based version this replaced was a free bypass ("decay
-    /// bombing"). `this_call_state` is `structural_state.max(hit_state)`
+    /// egress size: the byte count the old version read was a value the
+    /// agent declared itself, with zero server involvement, so decaying
+    /// on it was a free, computational bypass ("decay bombing" —
+    /// `docs/specs/spec-f1-clean-call-decay.md`) rather than evidence of
+    /// an actual clean response. `this_call_state` is
+    /// `structural_state.max(hit_state)`
     /// for THIS SPECIFIC call's response, independent of
     /// `self.current_state` — the same `new_state` value passed to
     /// `ingest_signature` for the same response.

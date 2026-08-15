@@ -6,8 +6,7 @@
 // crate — see src/bin/fake_pin_test_server.rs for why, instead of a Python
 // fixture script) — extending the pattern tests/cli_flags.rs already
 // established: exercise the compiled artifact itself, not internal
-// functions. See docs/specs/spec-sec03-hash-pin-enforcement.md for the full
-// scenario list this covers.
+// functions (docs/specs/spec-sec03-hash-pin-enforcement.md).
 //
 // The pure "given this pin status and these flags, quarantine or not"
 // decision logic itself is unit-tested directly in src/pin_policy.rs; these

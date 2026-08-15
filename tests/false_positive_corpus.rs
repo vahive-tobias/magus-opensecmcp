@@ -3,8 +3,7 @@
 // Backs the false-positive claims sprinkled through locked-rules.yaml's rule
 // comments (e.g. SECRET-AWS-001's "FP risk: README examples... flag-only,
 // not elevate") with an actual test instead of leaving them as assertions
-// nobody ever ran. See docs/specs/spec-fp-corpus-test.md for the full
-// rationale and the three-tier design this file implements.
+// nobody ever ran (docs/specs/spec-fp-corpus-test.md).
 //
 // The three tiers are NOT "hits vs no hits" — some locked rules are
 // deliberately designed to match legitimate content at flag severity

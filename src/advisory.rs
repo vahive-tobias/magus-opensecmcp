@@ -2,10 +2,9 @@
 //
 // SEC-01: inject a gateway-generated advisory into a response that just
 // caused a genuine provenance escalation, without stripping the response
-// or introducing any new JSON key or array element. See
-// docs/specs/spec-sec01-poisoned-content-advisory.md for the full spec,
-// and docs/specs/PROJECT-STATUS-AND-ROADMAP.md's `OP-1` entry for the
-// real-client experiment this is built on.
+// or introducing any new JSON key or array element
+// (docs/specs/spec-sec01-poisoned-content-advisory.md;
+// docs/specs/PROJECT-STATUS-AND-ROADMAP.md's `OP-1` entry).
 //
 // Honesty about verification status, per the spec: Tier 1
 // (`structuredContent.content`) is the ONLY tier directly verified against

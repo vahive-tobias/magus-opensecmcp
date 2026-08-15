@@ -4,9 +4,7 @@
 // hash-pin comparison. Kept separate from main.rs's I/O (spawning
 // downstream processes, printing) so "given this pin status and these
 // flags, what happens" can be unit tested directly, without spinning up a
-// real downstream connection. See
-// docs/specs/spec-sec03-hash-pin-enforcement.md for the full spec this
-// implements.
+// real downstream connection (docs/specs/spec-sec03-hash-pin-enforcement.md).
 //
 // `validate_policy` has grown into the general SecurityPolicy-wide sanity
 // check as later fixes landed (F3's `refuse_startup_on_tool_name_collision`,
