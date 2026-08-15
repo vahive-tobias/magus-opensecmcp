@@ -1362,7 +1362,31 @@ async fn handle_tools_call(
                     // extensions of the same principle).
                     if tracker.current_state > state_before {
                         let advisory_text = advisory::build_advisory_text(tracker.current_state, &hit_summary.rule_ids());
-                        advisory::inject_advisory(&mut real_result, &advisory_text);
+                        let tier = advisory::inject_advisory(&mut real_result, &advisory_text);
+
+                        // Logged unconditionally — this is also the only
+                        // audit trail provenance escalation itself has
+                        // anywhere in this codebase, not just a record of
+                        // which tier delivered the advisory. eprintln! is
+                        // reserved for the two outcomes where delivery is
+                        // doubtful or failed, pairing warn-with-audit the
+                        // same way schema_root_not_object does above.
+                        audit_logger.log_event("advisory_injection", serde_json::Map::from_iter([
+                            ("server_id".to_string(), serde_json::json!(mcp_server_id)),
+                            ("tool_name".to_string(), serde_json::json!(tool_name)),
+                            ("tier".to_string(), serde_json::json!(tier)),
+                            ("new_state".to_string(), serde_json::json!(tracker.current_state)),
+                            ("rule_ids".to_string(), serde_json::json!(hit_summary.rule_ids())),
+                        ]));
+                        if matches!(tier, advisory::InjectionTier::ContentBlockShadowed | advisory::InjectionTier::NoSafeField) {
+                            eprintln!(
+                                "[MAGUS] WARNING: '{}'/{} caused the session's provenance state to escalate to \
+                                 {:?}, but the in-band advisory could not be reliably delivered to the model in \
+                                 this response's shape ({:?}). Enforcement is unaffected -- gating still fires;\n\
+                                 [MAGUS]   only this notice may not reach the model.",
+                                mcp_server_id, tool_name, tracker.current_state, tier
+                            );
+                        }
                     }
 
                     serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": real_result })

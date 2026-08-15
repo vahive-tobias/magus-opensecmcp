@@ -16,28 +16,72 @@
 // new shape), not independently verified against a real client. Comments
 // on each tier below repeat this distinction rather than presenting all
 // three as equally proven.
+//
+// Tier 3 ("no safe field") is not a theoretical corner case: on the
+// reference server this project verifies against
+// (@modelcontextprotocol/server-filesystem), `read_media_file` returns
+// `structuredContent.content` as an array of image/audio/resource blocks,
+// never a string, and its `content[]` blocks are never `type: "text"`
+// either — by that tool's own declared schema, every call lands on Tier
+// 3. Reading a real image through it is also a plausible everyday trigger
+// for the very escalation this file exists to announce:
+// `classify_response` folds every string value in the raw response,
+// including a base64 image payload, into the text that feeds both the
+// size signal and the rule scanner, and `LONG_STRING_THRESHOLD` (200
+// bytes) is trivially exceeded by any real image. Confirmed directly
+// against the real package with a real PNG.
+//
+// Considered and rejected: extending an arbitrary sibling field inside
+// `structuredContent` instead of only `content[]`, to reach shapes like
+// `read_media_file`'s. The reference server's declared schemas use
+// `additionalProperties: false` with `required: ["content"]` (confirmed
+// against the live schema) — a server declaring `maxLength` or `pattern`
+// on whichever field got extended would mean injection manufactures a
+// response that violates the tool's own declared outputSchema: the
+// gateway producing exactly the deterministic contract breach it
+// elsewhere treats as evidence of compromise. Visibility is not worth
+// that trade. Don't re-propose it without addressing this.
 
 use crate::provenance::ProvenanceState;
+use serde::Serialize;
 use serde_json::Value;
 
 /// Which tier of the fallback ordering actually fired, or that no safe
 /// existing string field was available at all.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum InjectionTier {
     /// Appended to `structuredContent.content` (a string). The only tier
     /// directly verified against a real MCP client.
     StructuredContent,
     /// Appended to the first `content[]` block whose `type` is `"text"`,
-    /// extending its existing `text` string. A reasoned extension of
-    /// Tier 1's proven principle — not independently verified against a
-    /// real client.
+    /// extending its existing `text` string, with no `structuredContent`
+    /// key present on the result at all. The client reads `content[]`
+    /// directly here — a reasoned extension of Tier 1's proven principle,
+    /// not independently verified against a real client, but nothing
+    /// else on the result competes with it for the client's attention.
     ContentBlock,
+    /// Same write as `ContentBlock` — the first `content[]` text block was
+    /// extended — but `structuredContent` IS present on the result and
+    /// Tier 1 couldn't use it. Delivery is doubtful: CLAUDE.md's OP-1
+    /// finding is that a real client prefers `structuredContent` and
+    /// discards `content[]` entirely, but that finding was verified
+    /// against a populated, well-formed `structuredContent` — this
+    /// variant also fires for shapes never tested that way
+    /// (`structuredContent: null`, or the array-shaped `content`
+    /// `read_media_file` actually produces). Triggering on
+    /// `structuredContent.is_some()` is the conservative extension of
+    /// that finding, not a verified one: it labels delivery doubtful
+    /// rather than claiming a discard we haven't directly shown for
+    /// every such shape.
+    ContentBlockShadowed,
     /// No existing string field was available without introducing a new
     /// key or array element (both confirmed-or-strongly-suspected risky
     /// per the wire-format experiments). Nothing was injected. Enforcement
     /// itself is unaffected by this — state still changed, gating still
     /// fires — this is only a known, honestly-documented gap in in-band
-    /// visibility for that specific response shape.
+    /// visibility for that specific response shape. Reachable on the
+    /// reference server itself (see the module comment) — not a shape
+    /// nobody has produced.
     NoSafeField,
 }
 
@@ -57,7 +101,13 @@ pub fn inject_advisory(result: &mut Value, advisory: &str) -> InjectionTier {
         return InjectionTier::StructuredContent;
     }
 
-    // Tier 2 — reasoned extension, not independently verified.
+    // Tier 2 — reasoned extension, not independently verified. Whether
+    // `structuredContent` is merely present (even though Tier 1 couldn't
+    // use it) decides which of the two outcomes below this write is — see
+    // ContentBlockShadowed's doc comment for why `.is_some()` is the
+    // right, if conservative, trigger. Computed before the write so it
+    // reflects the result's shape on entry, not anything Tier 1 mutated.
+    let shadowed = result.get("structuredContent").is_some();
     if let Some(content_array) = result.get_mut("content").and_then(|c| c.as_array_mut()) {
         for block in content_array.iter_mut() {
             if block.get("type").and_then(|t| t.as_str()) != Some("text") {
@@ -66,7 +116,7 @@ pub fn inject_advisory(result: &mut Value, advisory: &str) -> InjectionTier {
             let existing_text = block.get("text").and_then(|t| t.as_str()).map(|s| s.to_string());
             if let Some(existing) = existing_text {
                 block["text"] = Value::String(format!("{existing}\n{advisory}"));
-                return InjectionTier::ContentBlock;
+                return if shadowed { InjectionTier::ContentBlockShadowed } else { InjectionTier::ContentBlock };
             }
         }
     }
@@ -113,11 +163,42 @@ mod tests {
 
     #[test]
     fn tier2_fires_when_no_structured_content_but_content_text_block_exists() {
+        // No `structuredContent` key at all -- guards the ContentBlock/
+        // ContentBlockShadowed split from collapsing to always-shadowed.
         let mut result = json!({
             "content": [{"type": "text", "text": "real output"}]
         });
         let tier = inject_advisory(&mut result, "ADVISORY");
         assert_eq!(tier, InjectionTier::ContentBlock);
+    }
+
+    #[test]
+    fn tier2_shadowed_fires_when_structured_content_present_but_unusable() {
+        // structuredContent IS present (so Tier 1 attempted it) but its
+        // `content` isn't a string, so Tier 1 fails over to the content[]
+        // text block -- which the client is nonetheless likely to ignore
+        // in favor of the structuredContent it just couldn't use.
+        let mut result = json!({
+            "content": [{"type": "text", "text": "real output"}],
+            "structuredContent": {"content": {"nested": "object"}}
+        });
+        let tier = inject_advisory(&mut result, "ADVISORY");
+        assert_eq!(tier, InjectionTier::ContentBlockShadowed);
+    }
+
+    #[test]
+    fn tier3_fires_on_read_media_file_shaped_result() {
+        // The real wire shape confirmed against
+        // @modelcontextprotocol/server-filesystem's read_media_file:
+        // structuredContent.content is an array of image blocks (Tier 1's
+        // .as_str() fails) and content[] holds only an image block, never
+        // type: "text" (Tier 2 finds nothing to extend either).
+        let mut result = json!({
+            "content": [{"type": "image", "data": "base64...", "mimeType": "image/png"}],
+            "structuredContent": {"content": [{"type": "image", "data": "base64...", "mimeType": "image/png"}]}
+        });
+        let tier = inject_advisory(&mut result, "ADVISORY");
+        assert_eq!(tier, InjectionTier::NoSafeField);
     }
 
     #[test]
