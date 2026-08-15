@@ -38,7 +38,10 @@ jobs:
         run: cargo check --verbose
 
       - name: Run unit tests
-        run: cargo test --verbose
+        # Plain `cargo test` halts at the first failing test binary and
+        # skips every one after it, so a red build would under-report
+        # which of them are actually broken.
+        run: cargo test --verbose --no-fail-fast
 
       - name: Verify release build
         run: cargo build --release --verbose
