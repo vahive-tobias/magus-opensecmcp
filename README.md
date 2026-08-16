@@ -422,6 +422,55 @@ the one that actually predicts long-run growth.) Real, but modest for
 most usage — plan around it if you leave a gateway running unattended
 for a long time.
 
+## Session risk budget
+
+This is a circuit breaker, not a bound on a determined attacker. The
+natural reading of "there's a budget and it runs out" is the opposite: at
+any ceiling high enough to survive a real, heavy day of legitimate tool
+use, it does not meaningfully constrain a competent adversary. Hundreds
+of dangerous actions is already total compromise, and single-shot
+exfiltration beats any nonzero ceiling in one call regardless of how it's
+set. What this mechanism actually does: stop a runaway or looping agent,
+limit unsophisticated automated abuse, and cap how bad an unnoticed
+compromise gets before the session ends. That's a real, useful property —
+just not the one "budget" makes it sound like at first glance.
+
+**What fills it.** Every approved tool call whose *effective* risk class
+(after provenance-state and `communicates_externally` adjustments — see
+"How it works") is `Medium` or above adds to a per-connection running
+total. `Low`-effective calls — most reads, on the shipped config — don't
+touch it at all: no check, no accrual, unconditionally. This is
+deliberate, not an oversight: reads are most of what a real agentic
+session does, and a budget that charged them refused the safest actions
+first and then broke the whole session on them — a real session hit that
+wall in under 50 calls, minutes into ordinary use, with no way to raise
+the ceiling and no way to tell what had happened.
+
+**What happens at exhaustion.** Once the running total would cross
+`security_policy.max_session_risk_bp` (default 2,000,000 — see that
+field's own comment in `registry.rs` for what it was derived from and why
+it's a calibration judgment, not an asserted-correct number), further
+Medium+ calls are refused with `RiskFloorExceeded`. Low-effective calls —
+reads — keep working, unaffected, for the rest of the connection. The
+gateway prints a one-time notice to stderr the moment this first happens,
+plus an audit event; it does not repeat on every call after.
+
+**It's per session, not permanent.** The budget lives on the connection,
+which lives until the client disconnects. Reconnecting your MCP client
+starts a fresh session with a fresh budget — for the honest user and for
+an attacker who has evaded detection alike. Raise the ceiling (or set it
+to `0` for a deliberate reads-only posture — that's a coherent
+configuration, not an error) via `security_policy.max_session_risk_bp` in
+`config.yaml`.
+
+**Two different stops, easy to conflate.** `RiskFloorExceeded` means "this
+session has done a lot" — Medium+ is closed, reads keep flowing, and it
+says nothing about whether anything is actually wrong. `Poisoned`
+(provenance state, not this budget) means "this session is compromised" —
+everything stops, reads included, and correctly so. If you see reads
+still succeeding after a refusal, that's the budget talking, not a gap in
+detection.
+
 ## Downstream timeouts
 
 Both halves of the downstream connection — the discovery handshake

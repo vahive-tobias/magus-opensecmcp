@@ -28,6 +28,31 @@ fn default_discovery_timeout_seconds() -> f64 {
     DEFAULT_DISCOVERY_TIMEOUT_SECONDS
 }
 
+/// Finding 1 of the third adversarial review (`docs/specs/
+/// ADVERSARIAL_REVIEW_03.md`): the per-session Medium+ risk budget's old
+/// ceiling (9,500 BP, a hard-coded const with no config path) was never
+/// chosen as a session policy — every number ever computed from these
+/// constants before this fix was an attacker scenario; nobody had asked
+/// how many NORMAL calls it permits. It permitted 46 Low-risk calls before
+/// refusing everything, reads included, for the life of the process.
+///
+/// 2,000,000 is a CALIBRATION JUDGMENT, not asserted as correct, in the
+/// same sense as the 135%/150% surcharges in `membrane.rs` — revisit with
+/// evidence. Derived from a heavy interactive day: the accruing unit is
+/// the gateway PROCESS, which lives until the MCP client restarts (not
+/// one task — potentially a whole day across many tasks), and agent
+/// edit-churn commonly runs 3-10x the actual file count (a file gets
+/// read, edited, and re-edited more than once per logical change). At
+/// this ceiling that's roughly 1,000 High-effective calls or roughly
+/// 2,500 Medium-effective ones. See README's "Session risk budget" for
+/// the honest framing: a circuit breaker against a runaway session, not a
+/// bound on a determined attacker.
+const DEFAULT_MAX_SESSION_RISK_BP: u32 = 2_000_000;
+
+fn default_max_session_risk_bp() -> u32 {
+    DEFAULT_MAX_SESSION_RISK_BP
+}
+
 /// M4 (see `docs/specs/ADVERSARIAL_REVIEW_OPUS.md`): `strict_schema_pinning`
 /// defaults to `true`, not `false`. A bare `#[serde(default)]` on a `bool`
 /// field yields `false`, which is exactly the warn-only-by-default posture
@@ -165,6 +190,17 @@ pub struct SecurityPolicy {
     /// for hash-pin comparison.
     #[serde(default)]
     pub refuse_startup_on_discovery_timeout: bool,
+    /// Ceiling for the per-session Medium+ risk budget (`membrane.rs`'s
+    /// `Membrane::evaluate` — Low-effective calls never touch this at
+    /// all, see that function's own comment for why). See
+    /// `default_max_session_risk_bp`'s doc comment for what the default
+    /// was derived from, and README's "Session risk budget" for what this
+    /// mechanism actually defends against. Deliberately NOT validated
+    /// against zero or a small value here — a zero budget is a coherent
+    /// "reads only" configuration, not an error, unlike the timeout
+    /// fields above.
+    #[serde(default = "default_max_session_risk_bp")]
+    pub max_session_risk_bp: u32,
 }
 
 impl Default for SecurityPolicy {
@@ -192,6 +228,7 @@ impl Default for SecurityPolicy {
             default_tool_timeout_seconds: DEFAULT_TOOL_TIMEOUT_SECONDS,
             default_discovery_timeout_seconds: DEFAULT_DISCOVERY_TIMEOUT_SECONDS,
             refuse_startup_on_discovery_timeout: false,
+            max_session_risk_bp: DEFAULT_MAX_SESSION_RISK_BP,
         }
     }
 }
@@ -423,6 +460,48 @@ mod tests {
         assert!(
             registry.security_policy.strict_schema_pinning,
             "a config.yaml that omits security_policy: entirely must default strict_schema_pinning to true"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Finding 1 of the third adversarial review, Change 1.2: the
+    /// Rust-level `Default` must land on `DEFAULT_MAX_SESSION_RISK_BP`,
+    /// matching `default_max_session_risk_bp` used for the serde path —
+    /// same two-independent-paths risk M4's tests above already guard
+    /// against, now for this field too.
+    #[test]
+    fn security_policy_default_has_the_default_max_session_risk_bp() {
+        assert_eq!(
+            SecurityPolicy::default().max_session_risk_bp,
+            DEFAULT_MAX_SESSION_RISK_BP,
+            "SecurityPolicy::default() must have max_session_risk_bp: {DEFAULT_MAX_SESSION_RISK_BP}"
+        );
+    }
+
+    /// The OTHER path, same reasoning as
+    /// `config_omitting_security_policy_block_defaults_strict_schema_pinning_true`:
+    /// a real config.yaml, loaded through the real deserializer, with
+    /// `security_policy:` omitted entirely.
+    #[test]
+    fn config_omitting_security_policy_block_defaults_max_session_risk_bp() {
+        let dir = std::env::temp_dir().join(format!("magus-registry-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("failed to create temp test dir");
+        let config_path = dir.join("config.yaml");
+        std::fs::write(
+            &config_path,
+            "downstream_servers:\n\
+             \x20\x20- server_id: \"fake\"\n\
+             \x20\x20\x20\x20transport: \"stdio\"\n\
+             \x20\x20\x20\x20command: \"true\"\n\
+             \x20\x20\x20\x20args: []\n",
+        )
+        .expect("failed to write temp config.yaml");
+
+        let registry = ToolRegistry::load_from_yaml(&config_path).expect("config with no security_policy: block must load");
+        assert_eq!(
+            registry.security_policy.max_session_risk_bp, DEFAULT_MAX_SESSION_RISK_BP,
+            "a config.yaml that omits security_policy: entirely must default max_session_risk_bp to {DEFAULT_MAX_SESSION_RISK_BP}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

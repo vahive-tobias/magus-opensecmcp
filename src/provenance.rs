@@ -258,26 +258,33 @@ pub fn state_from_rule_hits(summary: &RuleHitSummary, current_state: ProvenanceS
 
 /// Tracks the provenance state for a specific agent connection.
 ///
-/// F1 residual risk, stated with an actual number, not just a category
-/// shift (see `docs/specs/spec-f1-clean-call-decay.md`): this fix converts
-/// the "decay bombing" bypass from FREE and computational (one
+/// F1 residual risk, stated precisely, not just a category shift (see
+/// `docs/specs/spec-f1-clean-call-decay.md`): this fix converts the
+/// "decay bombing" bypass from FREE and computational (one
 /// agent-controlled local value, zero server involvement — the original
-/// bug) to EXPENSIVE and behavioral (`K` real round trips, real BP, a real
-/// audit trail, real replay protection). It does not make
-/// server-cooperated laundering impossible — an attacker who already
-/// controls the malicious server can have it emit `K` genuinely boring
-/// responses on purpose. At the starting constants, the minimal repeat of
-/// the original exploit's maneuver needs one `Contaminated -> Elevated`
-/// decay (`CLEAN_CALLS_TO_DECAY_CONTAMINATED` = 5 calls, not a full trip to
-/// `Clean`) before the next real signal: `5 x 200` BP (`Low`-risk base
-/// cost) `= 1,000` BP per launder cycle. Against a `9,500` BP floor
-/// (`membrane::RISK_FLOOR_BP`) with no other activity, that bounds a
-/// patient attacker to roughly 8-9 repetitions of "launder, then strike"
-/// before the floor alone ends the session — fewer in practice, since both
-/// the strikes and any other traffic also consume budget. A real,
-/// quantifiable, non-trivial cost and a genuine one-way door compared to
-/// today's unlimited free repetition — but a bound, not a wall. Don't read
-/// this as claiming the exploit is closed unqualified.
+/// bug) to EXPENSIVE and behavioral (`K` real round trips, a real audit
+/// trail). It does not make server-cooperated laundering impossible — an
+/// attacker who already controls the malicious server can have it emit
+/// `K` genuinely boring responses on purpose. At the starting constants,
+/// the minimal repeat of the original exploit's maneuver needs one
+/// `Contaminated -> Elevated` decay (`CLEAN_CALLS_TO_DECAY_CONTAMINATED` =
+/// 5 calls, not a full trip to `Clean`) before the next real signal.
+///
+/// Those `K` laundering calls cost nothing against the session risk
+/// budget: as of the fix for Finding 1 of the third adversarial review
+/// (`docs/specs/ADVERSARIAL_REVIEW_03.md`), Low-effective calls — which is
+/// what genuinely boring laundering responses classify as — don't accrue
+/// against `security_policy.max_session_risk_bp` at all (see
+/// `membrane::Membrane::evaluate`). So the honest bound here is on
+/// STRIKES, not on strikes-plus-padding: the session risk budget limits
+/// how many real Medium+ actions a session can take, full stop,
+/// independent of how much free boring traffic surrounds them. Laundering
+/// buys a patient attacker nothing, because it never cost them anything —
+/// charging boring calls toward the same ceiling as the strikes was
+/// bounding the wrong thing. The real, quantifiable cost that remains is
+/// on the `K` round trips themselves (time, a real audit trail, a real
+/// behavioral footprint) and on each strike's own BP — but don't read any
+/// of this as claiming the exploit is closed unqualified.
 pub struct AgentProvenanceTracker {
     pub current_state: ProvenanceState,
     /// Consecutive responses, since the last escalation or decay, that were

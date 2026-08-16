@@ -5,13 +5,11 @@ use crate::provenance::{AgentProvenanceTracker, ProvenanceState};
 use crate::quota::QuotaCounter;
 use crate::registry::{AuthoritySource, RiskClass, SourceGrade};
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
-pub const RISK_FLOOR_BP: u32 = 9_500;
 const SESSION_INIT_BP: u32 = 100;
-const MAX_NONCE_CACHE: usize = 100_000;
 
 #[derive(Debug, Deserialize)]
 pub struct Proposal {
@@ -40,7 +38,6 @@ pub struct Proposal {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum RejectionCode {
-    ReplayDetected,
     /// No longer produced (see §5 of
     /// docs/specs/spec-provenance-semantics-correction.md — the predicate
     /// this named, `external_content_influence && authority_source ==
@@ -52,7 +49,6 @@ pub enum RejectionCode {
     AuthorityLaundering,
     ExternalAuthorityViolation,
     RiskFloorExceeded,
-    SessionExhausted,
     AgentLimitReached,
     InboundPoisoningDetected,
     CriticalBlockedByProvenance,
@@ -61,11 +57,9 @@ pub enum RejectionCode {
 impl RejectionCode {
     pub fn as_str(&self) -> &'static str {
         match self {
-            RejectionCode::ReplayDetected => "ReplayDetected",
             RejectionCode::AuthorityLaundering => "AuthorityLaundering",
             RejectionCode::ExternalAuthorityViolation => "ExternalAuthorityViolation",
             RejectionCode::RiskFloorExceeded => "RiskFloorExceeded",
-            RejectionCode::SessionExhausted => "SessionExhausted",
             RejectionCode::AgentLimitReached => "AgentLimitReached",
             RejectionCode::InboundPoisoningDetected => "InboundPoisoningDetected",
             RejectionCode::CriticalBlockedByProvenance => "CriticalBlockedByProvenance",
@@ -131,18 +125,32 @@ pub struct Membrane {
     pub session_id: String,
     agent_accumulators: HashMap<Uuid, u32>,
     max_agents: usize,
-    executed_proposals: HashSet<String>,
     pub quota: QuotaCounter,
+    /// Operator-configured ceiling for the per-session Medium+ risk
+    /// budget — see `SecurityPolicy::max_session_risk_bp`'s own doc
+    /// comment for what it means and where the default comes from.
+    max_session_risk_bp: u32,
+    /// Fire-once tracking for the exhaustion notice (Change 1.3, third
+    /// adversarial review's Finding 1 fix), mirroring `QuotaCounter`'s own
+    /// fire-once shape: one `eprintln!` + one audit event the instant the
+    /// budget is first exhausted, never repeated after. Global to the
+    /// Membrane rather than per-connection because there is currently
+    /// exactly one stdio connection per gateway process (see `AS-10` in
+    /// `docs/specs/PROJECT-STATUS-AND-ROADMAP.md`) — if multi-agent
+    /// support ever lands, this should become per-connection instead of
+    /// staying a single flag.
+    budget_exhaustion_notice_fired: bool,
 }
 
 impl Membrane {
-    pub fn new(session_id: String, max_agents: usize, monthly_eval_limit: u32) -> Self {
+    pub fn new(session_id: String, max_agents: usize, monthly_eval_limit: u32, max_session_risk_bp: u32) -> Self {
         Self {
             session_id,
             agent_accumulators: HashMap::new(),
             max_agents,
-            executed_proposals: HashSet::new(),
             quota: QuotaCounter::new(monthly_eval_limit),
+            max_session_risk_bp,
+            budget_exhaustion_notice_fired: false,
         }
     }
 
@@ -190,16 +198,6 @@ impl Membrane {
             ]));
         }
 
-        if self.executed_proposals.len() >= MAX_NONCE_CACHE {
-            self.record_rejection(proposal, connection_id, tracker, audit, RejectionCode::SessionExhausted, 0);
-            return Err(RejectionCode::SessionExhausted);
-        }
-
-        if self.executed_proposals.contains(&proposal.id) {
-            self.record_rejection(proposal, connection_id, tracker, audit, RejectionCode::ReplayDetected, 0);
-            return Err(RejectionCode::ReplayDetected);
-        }
-
         let mut effective_risk = proposal.risk_class;
         if let Err(e) = modulate_risk_class(&mut effective_risk, &tracker.current_state, proposal.communicates_externally) {
             let code = match e {
@@ -224,8 +222,54 @@ impl Membrane {
         }
 
         let agent_bp = *self.agent_accumulators.get(&connection_id).unwrap_or(&SESSION_INIT_BP);
+
+        // Finding 1 of the third adversarial review: the session risk
+        // budget only ever grows, and reads are most of what a real agent
+        // does, so at any floor tight enough to matter it was refusing
+        // Low-risk reads within minutes of ordinary use — the safest
+        // actions filled the wall, then everything after was refused too.
+        // Low is now out of the budget entirely: no floor check, no
+        // accrual. It is still fully governed by everything above
+        // (provenance state, the Critical gate, authority) and by the
+        // audit log below — this only exempts it from the BP mechanism
+        // specifically.
+        //
+        // Keyed on `effective_risk`, the post-`modulate_risk_class` value
+        // — NEVER on `proposal.risk_class`. This is load-bearing, not a
+        // style choice: a tool tagged `communicates_externally` is bumped
+        // Low -> Medium (see `modulate_risk_class`), so keying on the
+        // declared class would let every tagged exfiltration tool skip
+        // the budget entirely, unbounded, forever — the one scenario this
+        // mechanism exists as a last resort against. Keying on effective
+        // risk means the set that ACCRUES and the set that gets REFUSED
+        // at exhaustion are the same set (Medium+), by construction.
+        if matches!(effective_risk, RiskClass::Low) {
+            let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+            let triggered_rule_ids = std::mem::take(&mut tracker.last_triggering_rule_ids);
+            audit.log(AuditRecord {
+                timestamp_unix: timestamp,
+                session_id: self.session_id.clone(),
+                connection_id: connection_id.to_string(),
+                proposal_id: proposal.id.clone(),
+                mcp_server_id: proposal.mcp_server_id.clone(),
+                tool_name: proposal.tool_name.clone(),
+                risk_class: proposal.risk_class,
+                authority_source: proposal.authority_source,
+                bootstrap: proposal.bootstrap,
+                communicates_externally: proposal.communicates_externally,
+                status: "Approved".to_string(),
+                rejection_code: None,
+                provenance_state: tracker.current_state,
+                effective_risk_class: effective_risk,
+                bp_consumed: 0,
+                r_abs_bp_after: agent_bp,
+                triggered_rule_ids,
+            });
+            return Ok(());
+        }
+
         let base_bp: u32 = match effective_risk {
-            RiskClass::Low => 200,
+            RiskClass::Low => unreachable!("Low returns above before base_bp is ever computed"),
             RiskClass::Medium => 800,
             RiskClass::High => 2_000,
             RiskClass::Critical => 4_000,
@@ -254,14 +298,35 @@ impl Membrane {
             contribution_bp = (contribution_bp * 150) / 100;
         }
 
-        if agent_bp + contribution_bp >= RISK_FLOOR_BP {
+        if agent_bp + contribution_bp >= self.max_session_risk_bp {
+            // One-time operator notice — see Change 1.3 of the third
+            // adversarial review's Finding 1 fix, mirroring quota.rs's
+            // fire-once shape exactly. Fires on the exact call that first
+            // crosses the ceiling, never again after, so a long session
+            // doesn't spam stderr once it's past the wall.
+            if !self.budget_exhaustion_notice_fired {
+                self.budget_exhaustion_notice_fired = true;
+                eprintln!(
+                    "[MAGUS] NOTICE: this session's Medium+ risk budget is spent \
+                     ({} BP, ceiling {}). Low-risk calls (most reads) are unaffected and \
+                     continue to work normally; only Medium/High/Critical actions are refused \
+                     from here on, for the rest of this connection. Reconnecting your MCP \
+                     client starts a fresh session with a fresh budget. To raise the ceiling, \
+                     set security_policy.max_session_risk_bp in config.yaml.",
+                    agent_bp, self.max_session_risk_bp
+                );
+                audit.log_event("session_risk_budget_exhausted", serde_json::Map::from_iter([
+                    ("connection_id".to_string(), serde_json::json!(connection_id.to_string())),
+                    ("bp_at_exhaustion".to_string(), serde_json::json!(agent_bp)),
+                    ("max_session_risk_bp".to_string(), serde_json::json!(self.max_session_risk_bp)),
+                ]));
+            }
             self.record_rejection(proposal, connection_id, tracker, audit, RejectionCode::RiskFloorExceeded, agent_bp);
             return Err(RejectionCode::RiskFloorExceeded);
         }
 
         let new_agent_bp = agent_bp + contribution_bp;
         self.agent_accumulators.insert(connection_id, new_agent_bp);
-        self.executed_proposals.insert(proposal.id.clone());
 
         // Decay no longer happens here — see
         // docs/specs/spec-f1-clean-call-decay.md. It used to be driven by
@@ -341,8 +406,23 @@ mod tests {
             .join("audit.jsonl")
     }
 
+    /// The old global RISK_FLOOR_BP constant's value (9,500), preserved
+    /// here as every existing test's floor so their arithmetic and
+    /// comments stay exactly as verified — the floor became a per-
+    /// Membrane, operator-configurable value (Change 1.2, third
+    /// adversarial review's Finding 1 fix), not a global constant, but
+    /// nothing about THIS test suite's already-correct floor-crossing
+    /// math needed to change just because the number now lives in a
+    /// parameter instead of a const. Tests specifically about the new
+    /// configurable ceiling use `make_membrane_with_floor` below instead.
+    const LEGACY_TEST_FLOOR_BP: u32 = 9_500;
+
     fn make_membrane(max_agents: usize, monthly_limit: u32) -> Membrane {
-        Membrane::new("test-session".to_string(), max_agents, monthly_limit)
+        Membrane::new("test-session".to_string(), max_agents, monthly_limit, LEGACY_TEST_FLOOR_BP)
+    }
+
+    fn make_membrane_with_floor(max_agents: usize, monthly_limit: u32, max_session_risk_bp: u32) -> Membrane {
+        Membrane::new("test-session".to_string(), max_agents, monthly_limit, max_session_risk_bp)
     }
 
     /// source_grade defaults to Known — a graded server, so it never
@@ -584,23 +664,6 @@ mod tests {
     }
 
     #[test]
-    fn replay_detection_second_call_with_same_id_is_rejected() {
-        let mut membrane = make_membrane(3, 5000);
-        let connection_id = Uuid::new_v4();
-        membrane.register_agent(connection_id).unwrap();
-        let mut tracker = AgentProvenanceTracker::new();
-        let audit = AuditLogger::new_with_path(temp_audit_path(), "test-session");
-        let proposal = make_proposal("prop-1", RiskClass::Low, AuthoritySource::User, false);
-
-        assert!(
-            membrane.evaluate(&proposal, connection_id, &mut tracker, &audit).is_ok(),
-            "first evaluation of a fresh id must succeed"
-        );
-        let second = membrane.evaluate(&proposal, connection_id, &mut tracker, &audit);
-        assert_eq!(second, Err(RejectionCode::ReplayDetected));
-    }
-
-    #[test]
     fn quota_crossing_does_not_reject_the_crossing_call_or_any_call_after() {
         // monthly_eval_limit = 1: the first call crosses the threshold
         // (count == limit). L9's fix makes this a notice, not a gate --
@@ -740,8 +803,9 @@ mod tests {
 
         // SESSION_INIT_BP = 100, High risk class costs 2000 BP each (no
         // external influence, state stays Clean so no bump). 100 + 2000*4
-        // = 8100 (< RISK_FLOOR_BP = 9500, all four approved); the 5th call
-        // would take it to 10100 (>= 9500), which must be the one rejected.
+        // = 8100 (< LEGACY_TEST_FLOOR_BP = 9500, all four approved); the
+        // 5th call would take it to 10100 (>= 9500), which must be the
+        // one rejected.
         for i in 0..4 {
             let proposal = make_proposal(&format!("prop-{i}"), RiskClass::High, AuthoritySource::User, false);
             let result = membrane.evaluate(&proposal, connection_id, &mut tracker, &audit);
@@ -789,52 +853,88 @@ mod tests {
     /// covered directly in provenance.rs's own `AgentProvenanceTracker`
     /// tests now.
     #[test]
-    fn successful_evaluation_records_id_and_updates_bp() {
+    fn successful_medium_plus_evaluation_updates_bp() {
+        // Renamed from `..._records_id_and_updates_bp`: id-recording no
+        // longer exists (replay protection was unreachable in production
+        // — proposal.id is always a freshly minted UUID, see PART 2 of
+        // the third adversarial review's Finding 1 fix — and was removed
+        // rather than kept as dead code with a session-bricking side
+        // effect). Also switched from Low to Medium: Low no longer
+        // accrues BP at all (Change 1.1), so this test's own point —
+        // "a successful evaluation updates BP" — needs an effective-risk
+        // tier that still does.
         let mut membrane = make_membrane(3, 5000);
         let connection_id = Uuid::new_v4();
         membrane.register_agent(connection_id).unwrap();
         let mut tracker = AgentProvenanceTracker::new();
         let audit = AuditLogger::new_with_path(temp_audit_path(), "test-session");
 
-        let proposal = make_proposal("prop-1", RiskClass::Low, AuthoritySource::User, false);
+        let proposal = make_proposal("prop-1", RiskClass::Medium, AuthoritySource::User, false);
 
         let result = membrane.evaluate(&proposal, connection_id, &mut tracker, &audit);
         assert!(result.is_ok());
-        assert!(
-            membrane.executed_proposals.contains("prop-1"),
-            "the proposal id must be recorded as executed"
-        );
         assert_eq!(
             *membrane.agent_accumulators.get(&connection_id).unwrap(),
-            SESSION_INIT_BP + 200, // Low risk class base BP
+            SESSION_INIT_BP + 800, // Medium risk class base BP
         );
     }
 
+    /// THE regression guard for Change 1.1 — Finding 1 of the third
+    /// adversarial review. A floor of 250 is smaller than even a single
+    /// Low call's OLD cost (200 BP on top of SESSION_INIT_BP=100 already
+    /// exceeds it) — if Low ever accrued again, this would fail on call 2
+    /// at the latest. Instead, 200 calls all succeed and the accumulator
+    /// never moves off SESSION_INIT_BP, because Low-effective calls skip
+    /// the budget mechanism entirely, not because the floor happens to be
+    /// generous.
     #[test]
-    fn session_exhaustion_once_executed_proposals_reaches_max_nonce_cache() {
-        // MAX_NONCE_CACHE is 100_000. Calling evaluate() that many times to
-        // get here would mean 100_000 real file-backed audit log writes -
-        // slow, and it doesn't exercise anything evaluate() does
-        // differently at scale. This test lives in the same module as
-        // Membrane, so it can populate the private executed_proposals set
-        // directly to the real MAX_NONCE_CACHE boundary, then call
-        // evaluate() once against a fresh id - this still tests the actual
-        // real constant's boundary condition, just without the O(100_000)
-        // I/O cost of getting there through the public API.
-        let mut membrane = make_membrane(3, 1_000_000);
+    fn low_effective_risk_never_accrues_or_hits_the_floor() {
+        let mut membrane = make_membrane_with_floor(3, 5000, 250);
         let connection_id = Uuid::new_v4();
         membrane.register_agent(connection_id).unwrap();
         let mut tracker = AgentProvenanceTracker::new();
         let audit = AuditLogger::new_with_path(temp_audit_path(), "test-session");
 
-        for i in 0..MAX_NONCE_CACHE {
-            membrane.executed_proposals.insert(format!("preexisting-{i}"));
+        for i in 0..200 {
+            let proposal = make_proposal(&format!("prop-{i}"), RiskClass::Low, AuthoritySource::User, false);
+            let result = membrane.evaluate(&proposal, connection_id, &mut tracker, &audit);
+            assert!(result.is_ok(), "Low call {i} must be approved regardless of the floor, got {result:?}");
         }
-        assert_eq!(membrane.executed_proposals.len(), MAX_NONCE_CACHE);
+        assert_eq!(
+            *membrane.agent_accumulators.get(&connection_id).unwrap(),
+            SESSION_INIT_BP,
+            "the accumulator must not move at all for Low-effective calls"
+        );
+    }
 
-        let proposal = make_proposal("fresh-id", RiskClass::Low, AuthoritySource::User, false);
+    /// The other half of the same regression guard: a tagged Low
+    /// proposal is Medium-EFFECTIVE (`communicates_externally` bumps it,
+    /// see `modulate_risk_class`), so it must accrue and eventually be
+    /// refused — proving the budget is keyed on `effective_risk`, not
+    /// `proposal.risk_class`. If keying ever regressed to the declared
+    /// class, this tagged tool would silently join the unbounded Low
+    /// lane instead, which is exactly the exfiltration-escapes-the-budget
+    /// scenario Change 1.1's own comment names as the reason the keying
+    /// choice is load-bearing.
+    #[test]
+    fn tagged_low_still_accrues_and_is_refused_at_the_floor() {
+        let mut membrane = make_membrane_with_floor(3, 5000, 900);
+        let connection_id = Uuid::new_v4();
+        membrane.register_agent(connection_id).unwrap();
+        let mut tracker = AgentProvenanceTracker::new();
+        let audit = AuditLogger::new_with_path(temp_audit_path(), "test-session");
+
+        // SESSION_INIT_BP=100, tagged Low -> Medium base 800: 100+800=900,
+        // which is not < 900, so this first tagged call is already the
+        // crossing one.
+        let mut proposal = make_proposal("prop-1", RiskClass::Low, AuthoritySource::User, false);
+        proposal.communicates_externally = true;
         let result = membrane.evaluate(&proposal, connection_id, &mut tracker, &audit);
-        assert_eq!(result, Err(RejectionCode::SessionExhausted));
+        assert_eq!(
+            result,
+            Err(RejectionCode::RiskFloorExceeded),
+            "a tagged Low (Medium-effective) call must still be bounded by the floor, got {result:?}"
+        );
     }
 
     #[test]

@@ -154,12 +154,26 @@ that field's own documentation in README for why.
 
 Stated more sharply: this is a rate limit, and a rate limit is the wrong
 shape of defense against a single-shot, irreversible action. Exfiltration
-succeeds in exactly one call. Measured directly against the running budget
-math: the tag's surcharge cuts the number of approved calls available
-before the risk floor ends the session from roughly 34 to roughly 8 — a
-real reduction, but an attacker who needs only one call is unaffected by
-whether 8 or 34 remained. Raising the cost of repetition does not
-constrain an action that doesn't repeat.
+succeeds in exactly one call, and nothing about the session risk budget's
+ceiling changes that.
+
+What the fix for Finding 1 of the third adversarial review changed is the
+shape of the comparison, not the core claim. Untagged `Low`-risk calls no
+longer accrue against the session risk budget at all — an untagged
+network-capable tool isn't merely cheaper to abuse than a tagged one, it
+is exempt from this control's ceiling entirely, unbounded by it in every
+practical sense. A tagged `Low` call is bumped to `Medium`-effective and
+stays bounded, at the same per-call cost as before this fix (base 800 BP
+× 135% once `external_content_influence` applies = 1080 BP — the tag
+changes what accrues, not how much a given tier costs). So the honest
+comparison is no longer "roughly 34 calls vs. roughly 8" — it is unbounded
+vs. bounded. That is a STRONGER argument for tagging a tool
+`communicates_externally`, not a weaker one: an operator who forgets to
+tag a genuinely network-capable tool doesn't just make it cheaper to
+abuse, they remove this control's reach over it completely. None of this
+changes the core claim: a single call, tagged or untagged, still succeeds
+either way, because exfiltration needs exactly one call and a rate limit
+— bounded or not — cannot be the thing that stops it.
 
 **Config that tries to weaken itself.** `user-rules.yaml`'s action grammar
 has no `allow`/`bypass` value — a rule that tries to weaken enforcement

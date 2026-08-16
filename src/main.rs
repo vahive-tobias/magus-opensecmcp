@@ -754,7 +754,12 @@ async fn main() -> Result<()> {
 
     // ---- Core governance components (session_id/audit_logger now
     //      constructed earlier, before discovery — see the comment there) ----
-    let membrane = Arc::new(Mutex::new(Membrane::new(session_id.clone(), DEFAULT_MAX_AGENTS, DEFAULT_MONTHLY_EVAL_LIMIT)));
+    let membrane = Arc::new(Mutex::new(Membrane::new(
+        session_id.clone(),
+        DEFAULT_MAX_AGENTS,
+        DEFAULT_MONTHLY_EVAL_LIMIT,
+        registry.security_policy.max_session_risk_bp,
+    )));
     let connection_id = Uuid::new_v4();
     {
         let mut mem = membrane.lock().await;
